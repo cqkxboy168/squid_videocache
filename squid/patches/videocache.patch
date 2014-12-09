@@ -1,0 +1,3834 @@
+diff -Naur squid-2.7.STABLE9-ori/src/acsmDFA.c squid-2.7.STABLE9-new/src/acsmDFA.c
+--- squid-2.7.STABLE9-ori/src/acsmDFA.c	1970-01-01 08:00:00.000000000 +0800
++++ squid-2.7.STABLE9-new/src/acsmDFA.c	2014-06-18 02:04:11.784233211 +0800
+@@ -0,0 +1,661 @@
++#include <assert.h>
++#include "acsmDFA.h"
++
++#define MAXPATTERNLEN 257
++#define SHOW_PATTERN_RESULT
++
++
++
++ACSM_STRUCT *acsm_cap[ACSM_NUM] = {NULL};
++
++
++static unsigned int nfound = 0;
++/************************************************ 
++*Æ¥ÅäÊÇ·ñ·¢ÏÖ×Ö·û´®º¯Êý
++* ÊäÈë£º 
++* pattern:×Ô¶¯»úÄ£Ê½´®¼¯ºÏÖ¸Õë
++* mlist: ·¢ÏÖµÄÄ£Ê½´®
++* ·µ»ØÖµ£º ·¢ÏÖ×Ö·û´®µÄflag
++************************************************/ 
++int PrintMatch (ACSM_PATTERN * pattern,ACSM_PATTERN * mlist) 
++{
++	/* Count the Each Match Pattern */
++   ACSM_PATTERN *temp = pattern;
++	for (;temp!=NULL;temp=temp->next) {
++		if(!strcmp((const char *)temp->patrn_cap,(const char *)mlist->patrn_cap)){
++			temp->nmatch++;
++			nfound++;
++			return temp->urlflag;
++			break;
++		}		
++	}
++	return 0;
++}
++
++/************************************************ 
++*Êä³öÉó¼Æ½á¹û²¢Çå0º¯Êý
++* ÊäÈë£º 
++* pattern:×Ô¶¯»úÄ£Ê½´®¼¯ºÏÖ¸Õë
++* ·µ»ØÖµ£º 
++************************************************/ 
++void PrintSummary (ACSM_STRUCT *acsm)
++{
++	ACSM_PATTERN * mlist = acsm->acsmPatterns;
++
++	for (;mlist!=NULL;mlist=mlist->next){
++	#ifdef SHOW_PATTERN_RESULT
++		printf("***%-20s:%-5d\n",mlist->patrn_cap,mlist->nmatch);
++	#endif
++		mlist->nmatch = 0;			
++	}
++#ifdef SHOW_PATTERN_RESULT
++	printf("####Total matching number is:%d#####\n\n\n",nfound);
++#endif
++	nfound=0;
++}
++
++/*
++*Malloc the AC memory
++*/
++static void *AC_MALLOC(uint32_t n)
++{
++	void *p;
++	p = malloc(n);
++	return p;
++}
++
++/*
++*Free the AC memory
++*/
++static void AC_FREE(void *p)
++{
++	if(p)
++       free(p);
++	p = NULL;
++}
++
++/*
++*Struct of Queue Node
++*/
++typedef struct _qnode {
++	uint32_t state;			
++	struct _qnode *next;		
++}QNODE;
++
++/*
++*Struct of Queue
++*/
++typedef struct _queue {
++	QNODE *head,*tail;			
++	uint32_t count;				
++}QUEUE;
++
++/*
++*Init the Queue
++*/
++static void queue_init(QUEUE *s)
++{
++	s->head = s->tail = NULL;			
++	s->count = 0;
++}
++/*
++*Add node to the queue from tail
++*/
++static void queue_add(QUEUE *s, uint32_t state)
++{
++	QNODE *q;
++	if(!s->head) {
++		q=s->tail=s->head=(QNODE *)AC_MALLOC(sizeof(QNODE)); 
++		//MEMASSERT(q,"queue_add");	
++		q->state=state;			
++		q->next=NULL;
++	}
++	else {
++		q=(QNODE *)AC_MALLOC(sizeof(QNODE));
++		//MEMASSERT(q,"queue_add");
++		q->state=state;
++		q->next=NULL;
++		s->tail->next=q;
++		s->tail=q;		       
++	}
++
++	s->count++;
++}
++
++/*
++*Remove node from haed of the queue
++*/
++static int queue_remove(QUEUE *s)
++{
++	uint32_t state=0;
++	QNODE *q;
++	if(s->head) {
++		q=s->head;				
++		state=q->state;
++		s->head=s->head->next;   	
++		s->count--;
++		if(!s->head) {
++			s->tail=NULL;
++			s->count=0;
++		}
++
++		AC_FREE(q);
++	}
++
++	return state;
++}
++
++/*
++*Get the count of the node in the queue
++*/
++static int queue_count(QUEUE *s)
++{
++	return s->count;
++}
++
++/*
++*Free the queue memory
++*/
++static void queue_free(QUEUE *s)
++{
++	while(queue_count(s)) {
++		queue_remove(s);
++	}
++}
++/*
++*case translation table
++*/
++static unsigned char xlatcase[256];
++/*
++*init the xlatecase table,trans alpha to UpperMode, just for the N0Case state.For example:b->B,D->D
++*/
++
++static void init_xlatcase()
++{
++	uint32_t i;
++	for(i=0;i<256;i++) {
++		xlatcase[i] = (unsigned char)toupper(i);
++	}
++}
++
++/*
++*Convert the pattern string into uppermode,for example:beijing->BEIJING
++*/
++void ConvertCaseEX(unsigned char *d,unsigned char *s,uint32_t m)
++{
++	uint32_t i;
++	for(i=0; i<m; i++) {
++		d[i]=xlatcase[s[i]];
++	}
++}
++
++
++
++/*
++*   Add a pattern to the list of patterns for this state machine
++*/ 
++static int acsmAddPattern(ACSM_STRUCT *p, unsigned char *pat, uint32_t n,uint32_t urlflag) 
++{
++	ACSM_PATTERN *plist;
++	int len = 0;
++
++	plist = (ACSM_PATTERN *)AC_MALLOC(sizeof(ACSM_PATTERN));
++	//MEMASSERT(plist, "acsmAddPattern");
++	
++	plist->patrn_cap = (unsigned char *)AC_MALLOC(n+1);
++	//MEMASSERT(plist->patrn_cap, "acsmAddPattern");
++	memset(plist->patrn_cap + n, 0,1);
++	ConvertCaseEX(plist->patrn_cap, pat, n);
++	plist->n_cap = n;
++	
++	plist->nmatch=0;
++
++  plist->urlflag=urlflag;
++  
++	/*Add the pattern into the pattern list*/
++	plist->next = p->acsmPatterns;
++	p->acsmPatterns = plist;
++
++	return 0;
++}
++
++
++int acsm_parse_line(const char *urlFile, ACSM_STRUCT *acsm)
++{
++	char line[LEN];
++	unsigned char keychar[LEN];
++	unsigned char siteflag[3];
++  unsigned char *start,*p,*q,*k;//p is the end point of keychar,k is the start point of siteflag,q is the end point of siteflag
++	FILE *kwFp = fopen(urlFile, "r");
++
++	if (!kwFp) {
++		fprintf(stderr, "Open url file error!\n");
++		return -1;
++	}
++
++	memset(line, 0, sizeof(line));
++  
++	while (fgets(line, LEN, kwFp))
++	{
++		assert(line != NULL);
++		if (strlen(line) >= MAXPATTERNLEN)
++			continue;
++		if (line[0] == '\0' || line[0] == '#')
++			continue;
++    start= line;
++		p = line;
++
++		while(*p != '\0' || *p !='\n' || *p== '\r')
++		{
++		 if (*p==' ' || *p== '\t' ) {
++				q = p+1;
++				break;
++			}
++			else {
++				p++;
++			}
++		}
++		
++		memset(keychar, 0, sizeof(keychar));
++		
++	  strncpy(keychar,line,p-start);
++	  
++	  while(*q != '\0')
++	  {
++	  	if(*q-'0'>=0 && *q-'0'<=9){
++	  	   k=q;
++	  	   break;
++	  	}
++	  	else
++	  		q++;
++	  }
++	  
++	  while(*q != '\0')
++	  {
++	  	if (*q==' ' || *q== '\t' || *q=='\n' || *q== '\r' ) {
++				break;
++			}
++		  else if(*q-'0'>=0 && *q-'0'<=9){
++		  	q++;
++			}
++			else {
++				printf("grammar error,.txt flag must number!\n");
++				return 0;
++			}
++	  }
++	  memset(siteflag, 0, sizeof(siteflag));
++	  if(q-k<= 3)
++	    strncpy(siteflag,k,q-k);
++	  else
++	  	printf("grammar error,.txt flag too long!\n");
++	   
++	  printf("key:%s  flag:%d\n",keychar,atoi(siteflag));
++		if (line[0] != '\0') {
++			acsmAddPattern((ACSM_STRUCT *)acsm, (unsigned char *)keychar, strlen(keychar),atoi(siteflag));
++		}
++	}
++
++	fclose(kwFp);
++
++	return 0;
++}
++
++/*
++*add a pattern to the list of patterns terminated at this state, insert at front of it
++*/
++static void AddMatchListEntry(ACSM_STRUCT *acsm, uint32_t state, ACSM_PATTERN *px)
++{
++	ACSM_PATTERN *p,*q;
++	p=(ACSM_PATTERN *)AC_MALLOC(sizeof(ACSM_PATTERN));
++	//MEMASSERT(p,"AddMatchListEntry");
++	memcpy(p,px,sizeof(ACSM_PATTERN));
++	q=acsm->acsmStateTable[state].MatchList;
++	while (q!=NULL) {
++		if(!strcmp((const char *)p->patrn_cap,(const char *)q->patrn_cap))
++			return;
++		q=q->next;
++	}
++
++	p->next=acsm->acsmStateTable[state].MatchList;
++	acsm->acsmStateTable[state].MatchList=p;
++}
++
++/*
++*Add pattern states
++*/
++static void AddPatternStates(ACSM_STRUCT *acsm,ACSM_PATTERN *p)
++{
++	unsigned char *pattern;
++	uint32_t state=0,n,next,temp;
++	n=p->n_cap;
++	pattern=p->patrn_cap;
++	acsm->acsmStateTable[0].flag=SOLID_STATE;
++
++	//Match up pattern with existing states
++	for (;n>0;pattern++,n--) {
++		next=acsm->acsmStateTable[state].NextState[*pattern];
++		if (next == ACSM_FAIL_STATE)				     
++			break;
++		state=next;	
++	}	
++
++	//Add new states for the rest of the pattern bytes,1 state per byte
++	for (;n>0;pattern++,n--) {
++		temp=state;
++		acsm->acsmNumState++;
++		acsm->acsmStateTable[state].NextState[*pattern]=acsm->acsmNumState;
++		state=acsm->acsmNumState;
++		acsm->acsmStateTable[state].flag=SOLID_STATE;
++		if (*pattern >= 128 && acsm->acsmStateTable[temp].flag==SOLID_STATE) {
++			acsm->acsmStateTable[state].flag=VIRTUAL_STATE1;	 
++		}
++	}
++
++	/*Add the pattern to the MatchList of the state*/
++	AddMatchListEntry(acsm,state,p);
++}
++
++/*
++*Build NFA and DFA based on the NFA
++*/
++static void Build_DFA(ACSM_STRUCT *acsm)
++{
++	uint32_t r, s;
++	uint32_t i;
++	QUEUE q, *queue = &q;		
++//	ACSM_PATTERN * mlist=0;		
++//	ACSM_PATTERN * px=0;		
++
++	/* Init a Queue */ 
++	queue_init(queue);			
++
++	/* Add the state 0 transitions 1st */
++	/* 1st depth Node's FailState is 0, fail(x)=0 */
++	for (i = 0; i < ALPHABET_SIZE; i++) {
++		s = acsm->acsmStateTable[0].NextState[i];	
++		if (s) {
++			queue_add(queue, s);						
++			acsm->acsmStateTable[s].FailState = 0;		
++		}
++	}
++
++	/* Build the fail state transitions for each valid state */
++	while (queue_count(queue) > 0) {
++		r = queue_remove(queue);				   
++
++		/* Find Final States for any Failure */ 
++		for (i = 0; i < ALPHABET_SIZE; i++) {
++			uint32_t fs, next;
++			/**get the next state from r**/
++			if ((s = acsm->acsmStateTable[r].NextState[i]) != ACSM_FAIL_STATE) {
++				queue_add(queue, s);			
++				fs = acsm->acsmStateTable[r].FailState; 
++				/* 
++				*  Locate the next valid state for 'i' starting at s 
++				*/ 							
++				while ((next=acsm->acsmStateTable[fs].NextState[i]) == ACSM_FAIL_STATE) {
++					fs = acsm->acsmStateTable[fs].FailState;
++				}
++				/*
++				 *  Update 's' state failure state to pouint32_t to the next valid state
++				 */ 
++				acsm->acsmStateTable[s].FailState = next;
++			} else {
++				acsm->acsmStateTable[r].NextState[i] = \
++					acsm->acsmStateTable[acsm->acsmStateTable[r].FailState].NextState[i];
++			}
++		}
++	}
++
++	/* Clean up the queue */ 
++	queue_free(queue);
++}
++
++/*
++* Init the acsm DataStruct	
++*/ 
++ACSM_STRUCT *acsmNew() 
++{
++	ACSM_STRUCT *p;
++	init_xlatcase();					
++	p = (ACSM_STRUCT *) AC_MALLOC(sizeof(ACSM_STRUCT));	
++	//MEMASSERT (p, "acsmNew");
++	if (p)
++		memset(p, 0, sizeof (ACSM_STRUCT));
++	return p;
++}
++
++/*
++*   Compile State Machine
++*/ 
++int acsmCompile_cap(ACSM_STRUCT * acsm) 
++{
++	uint32_t i, k;
++	ACSM_PATTERN * plist;
++
++	/* Count number of states */ 
++	acsm->acsmMaxState = 1; /*State 0*/
++	for (plist = acsm->acsmPatterns; plist != NULL; plist = plist->next) {
++		acsm->acsmMaxState += plist->n_cap;
++	}
++
++	acsm->acsmStateTable = (ACSM_STATETABLE *)AC_MALLOC(sizeof(ACSM_STATETABLE) * \
++			acsm->acsmMaxState);
++	//MEMASSERT(acsm->acsmStateTable, "acsmCompile");
++	memset(acsm->acsmStateTable, 0,sizeof (ACSM_STATETABLE) * acsm->acsmMaxState);
++	/* Initialize state zero as a branch */ 
++	acsm->acsmNumState = 0;
++
++	/* Initialize all States NextStates to FAILED */
++	for (k = 0; k < acsm->acsmMaxState; k++) {
++		for (i = 0; i < ALPHABET_SIZE; i++) {
++			acsm->acsmStateTable[k].NextState[i] = ACSM_FAIL_STATE;
++		}
++	}
++
++	/* This is very important */
++	/* Add each Pattern to the State Table */ 
++	for (plist = acsm->acsmPatterns; plist != NULL; plist = plist->next) {
++		AddPatternStates(acsm, plist);
++	}
++
++	/* Set all failed state transitions which from state 0 to return to the 0'th state */ 
++	for (i = 0; i < ALPHABET_SIZE; i++) {
++		if (acsm->acsmStateTable[0].NextState[i] == ACSM_FAIL_STATE) {
++			acsm->acsmStateTable[0].NextState[i] = 0;
++		}
++	}
++
++	/* Build the NFA  */ 
++	Build_DFA(acsm);
++
++	return 0;
++}
++
++/*64KB Memory*/
++//static unsigned char Tc[MAXLINELEN];
++
++/*
++*   Search Text or Binary Data for Pattern matches
++*/ 
++int acsmSearch_cap(ACSM_STRUCT * acsm, unsigned char *Tx, unsigned int n) 
++{
++	unsigned state, temp, fail;
++	ACSM_PATTERN *mlist;
++	unsigned char *Tend;
++	ACSM_STATETABLE * StateTable = acsm->acsmStateTable;
++	unsigned char *T;
++
++	nfound = 0;
++
++	if((int) n <= 0){
++		return -1;
++	}
++
++	/* Case conversion */
++	/* ConvertCaseEX(Tc, Tx, n);
++	T = Tc;
++	Tend = Tc + n;*/
++	//////////////////////////////////////////////////////////////////////////
++	/*no case conversion*/
++	T = Tx;
++	Tend = Tx + n;
++	//////////////////////////////////////////////////////////////////////////
++	
++	for (state = 0; T < Tend; T++) {
++		temp=state;
++
++		if(*T == '\0')
++			return -1; 
++
++		state = StateTable[state].NextState[*T];
++
++		if(*T < 128) {
++			 /* State is an accept state? */
++			if( StateTable[state].MatchList != NULL ){
++				for(mlist=StateTable[state].MatchList; mlist!=NULL;mlist=mlist->next){
++					PrintMatch(acsm->acsmPatterns,mlist);
++					return PrintMatch (acsm->acsmPatterns,mlist);
++        }
++      }
++
++			fail=StateTable[state].FailState;
++
++			while(fail!=0) {
++				if(StateTable[fail].MatchList!=NULL && StateTable[fail].flag==SOLID_STATE){
++					for(mlist=StateTable[fail].MatchList; mlist!=NULL;mlist=mlist->next){
++						//nfound++;
++						return PrintMatch (acsm->acsmPatterns,mlist);
++
++					
++					}
++				}
++				fail=StateTable[fail].FailState;
++			}
++		}
++		else if(*T >= 128){
++			/*forbide virtual state to virtual state*/
++			if(StateTable[temp].flag==VIRTUAL_STATE1 && StateTable[state].flag==VIRTUAL_STATE1)
++				state = 0;
++		    /*jump one char to avoid wrong matching*/
++			if(state==0 && StateTable[temp].flag == SOLID_STATE) 
++				T++;
++			else{
++				if( StateTable[state].MatchList != NULL && StateTable[temp].flag==VIRTUAL_STATE1){
++					for( mlist=StateTable[state].MatchList; mlist!=NULL;mlist=mlist->next){
++						PrintMatch (acsm->acsmPatterns,mlist); 
++
++						if (nfound) {
++							return acsm->acsmPatterns->urlflag;
++						}
++					}
++				}
++				fail=StateTable[state].FailState;
++				while(fail!=0){
++					if(StateTable[fail].MatchList!=NULL && StateTable[fail].flag==SOLID_STATE){
++						for(mlist=StateTable[fail].MatchList; mlist!=NULL;mlist=mlist->next){
++							//nfound++;
++							PrintMatch (acsm->acsmPatterns,mlist);
++
++							return PrintMatch (acsm->acsmPatterns,mlist);
++						}
++					}
++					fail=StateTable[fail].FailState;
++				}
++			}
++			/* State is a accept state? */
++		}
++	}
++
++	return 0;
++	//return nfound;
++}
++
++/*
++*   Free all memory
++*/ 
++void acsmFree (ACSM_STRUCT * acsm) 
++{
++	unsigned  i;
++	ACSM_PATTERN * mlist, *ilist;
++
++	if(NULL == acsm)
++		return;
++
++	for (i = 0; i < acsm->acsmNumState; i++) {
++		if (acsm->acsmStateTable[i].MatchList != NULL) {
++			mlist = acsm->acsmStateTable[i].MatchList;
++			while (mlist) {
++				ilist = mlist;	
++				mlist = mlist->next;			
++				AC_FREE (ilist->patrn_cap);
++				AC_FREE (ilist);				
++			}
++		}
++	}
++
++	AC_FREE (acsm->acsmPatterns);
++	AC_FREE (acsm->acsmStateTable);
++	acsm = NULL;
++}
++
++/*
++**»ñÈ¡Ä£Ê½´®
++*/
++int acsmDFA(ACSM_STRUCT *acsm)
++{
++	// read patterns from conf_file
++   
++/*Generate GtoTo Table and Fail Table*/ 
++	acsmCompile_cap(acsm);
++
++	return 0;
++}
++
++int acsm_changed(uint8_t *msg, int len, uint8_t **retbuf, int *retlen)
++{
++	int i, ret;
++	ACSM_STRUCT *acsm_old;
++	for (i = 0; i < ACSM_NUM; i++) {
++		ACSM_STRUCT *acsm_cap_new = NULL;
++		acsm_cap_new = acsmNew();	
++		ret = acsmDFA(acsm_cap_new);
++		if(ret == -1){
++			goto error;
++		}
++
++		if(acsm_cap[i]) {
++			acsm_old = acsm_cap[i];
++			acsm_cap[i] = acsm_cap_new;
++
++			acsmFree(acsm_old);
++		}
++		else 
++			acsm_cap[i] = acsm_cap_new;
++	}
++
++	return 0;
++
++error:
++	//fprintf(stderr, "malloc acsm failed: %s", strerror(errno));
++	fprintf(stderr, "malloc acsm failed:\n");
++	return -1;
++}
++
++int init_acsm(int n,const char *fileName)
++{
++
++	  int ret;
++		acsm_cap[n] = acsmNew();
++		
++		acsm_parse_line(fileName, acsm_cap[n]);
++
++		ret = acsmDFA(acsm_cap[n]);
++		if(ret == -1){
++			fprintf(stderr,"create acsm_gb fail!\n");
++			return ret;
++		}
++	//get_interference();
++	return 0;
++}
++
+diff -Naur squid-2.7.STABLE9-ori/src/acsmDFA.h squid-2.7.STABLE9-new/src/acsmDFA.h
+--- squid-2.7.STABLE9-ori/src/acsmDFA.h	1970-01-01 08:00:00.000000000 +0800
++++ squid-2.7.STABLE9-new/src/acsmDFA.h	2014-06-18 02:04:18.452232317 +0800
+@@ -0,0 +1,64 @@
++#ifndef _ACSM_H
++#define _ACSM_H
++#include <stdint.h>
++#include <stdio.h>
++#include <string.h>
++#include <ctype.h>
++#include <stdlib.h>
++
++#define LEN 1024
++#define ACSM_NUM 		2
++#define ALPHABET_SIZE	256	                //size of  alphabet
++		
++#define ACSM_FAIL_STATE 	-1	           		//fail state
++#define SOLID_STATE    		0	               //solid state
++#define VIRTUAL_STATE1		1	               //virtual state1
++#define VIRTUAL_STATE2		2	               //virtual state2
++#define VIRTUAL_STATE3		3	               //virtual state3
++
++
++
++/*
++**struct of pattern
++*/
++typedef struct _acsm_pattern {
++	struct _acsm_pattern    *next;				//pouint32_ter to next pattern
++	unsigned char			*patrn_cap; 		//pointer of pattern's captital
++	unsigned int				n_cap;					//length of pattern
++  unsigned int 	 			nmatch;				//number of successes of matching pattern
++  unsigned int urlflag; // identification number of different video web url
++
++} ACSM_PATTERN;
++
++/*
++**struct of state
++*/
++typedef struct {	
++    unsigned		flag;							//flag of state:solid or virtual?			
++	unsigned 	NextState[ALPHABET_SIZE];		//next state-based on input character
++	unsigned 	FailState;						//fail state-used when building NFA & DFA
++	ACSM_PATTERN *MatchList;					//list of patterns those and here,if any
++} ACSM_STATETABLE;
++
++/*
++**struct of state machine
++*/
++typedef struct {
++	unsigned acsmMaxState;			       		//maximum number of states
++	unsigned acsmNumState;						//number of states
++	ACSM_PATTERN	*acsmPatterns;		       //pointer to patterns
++	ACSM_STATETABLE	*acsmStateTable;	       //pointer to state table
++} ACSM_STRUCT;
++
++extern ACSM_STRUCT *acsm_cap[ACSM_NUM];
++
++int init_acsm(int n,const char *fileName);
++void ConvertCaseEX(unsigned char *d,unsigned char *s,uint32_t m);
++int acsmSearch_cap(ACSM_STRUCT *acsm,unsigned char *Tx,uint32_t n);
++
++/*
++**print the sunmmary of matching
++*/
++void PrintSummary (ACSM_STRUCT *acsm);
++#endif
++
+diff -Naur squid-2.7.STABLE9-ori/src/auth_modules.c squid-2.7.STABLE9-new/src/auth_modules.c
+--- squid-2.7.STABLE9-ori/src/auth_modules.c	1970-01-01 08:00:00.000000000 +0800
++++ squid-2.7.STABLE9-new/src/auth_modules.c	2014-06-18 02:04:11.784233211 +0800
+@@ -0,0 +1,10 @@
++/* automatically generated by ./auth_modules.sh basic
++ * do not edit
++ */
++#include "squid.h"
++
++extern AUTHSSETUP authSchemeSetup_basic;
++void authSchemeSetup(void)
++{
++	authSchemeAdd("basic", authSchemeSetup_basic);
++}
+diff -Naur squid-2.7.STABLE9-ori/src/cf_gen_defines.h squid-2.7.STABLE9-new/src/cf_gen_defines.h
+--- squid-2.7.STABLE9-ori/src/cf_gen_defines.h	1970-01-01 08:00:00.000000000 +0800
++++ squid-2.7.STABLE9-new/src/cf_gen_defines.h	2014-06-18 02:04:18.452232317 +0800
+@@ -0,0 +1,474 @@
++/* Generated automatically from cf.data.pre
++ * DO NOT EDIT
++*/
++struct { const char *name; const char *enable; int defined;} defines[] = {
++{"USE_HTCP", "--enable-htcp", 
++#if USE_HTCP
++1
++#else
++0
++#endif
++},
++{"USE_HTCP", "--enable-htcp", 
++#if USE_HTCP
++1
++#else
++0
++#endif
++},
++{"USE_IDENT", "--enable-ident-lookups", 
++#if USE_IDENT
++1
++#else
++0
++#endif
++},
++{"FOLLOW_X_FORWARDED_FOR", "-DFOLLOW_X_FORWARDED_FOR", 
++#if FOLLOW_X_FORWARDED_FOR
++1
++#else
++0
++#endif
++},
++{"FOLLOW_X_FORWARDED_FOR", "-DFOLLOW_X_FORWARDED_FOR", 
++#if FOLLOW_X_FORWARDED_FOR
++1
++#else
++0
++#endif
++},
++{"FOLLOW_X_FORWARDED_FOR", "-DFOLLOW_X_FORWARDED_FOR", 
++#if FOLLOW_X_FORWARDED_FOR
++1
++#else
++0
++#endif
++},
++{"FOLLOW_X_FORWARDED_FOR", "-DFOLLOW_X_FORWARDED_FOR", 
++#if FOLLOW_X_FORWARDED_FOR
++1
++#else
++0
++#endif
++},
++{"USE_SSL", "--enable-ssl", 
++#if USE_SSL
++1
++#else
++0
++#endif
++},
++{"USE_SSL", "--enable-ssl", 
++#if USE_SSL
++1
++#else
++0
++#endif
++},
++{"USE_SSL", "--enable-ssl", 
++#if USE_SSL
++1
++#else
++0
++#endif
++},
++{"USE_SSL", "--enable-ssl", 
++#if USE_SSL
++1
++#else
++0
++#endif
++},
++{"USE_SSL", "--enable-ssl", 
++#if USE_SSL
++1
++#else
++0
++#endif
++},
++{"USE_SSL", "--enable-ssl", 
++#if USE_SSL
++1
++#else
++0
++#endif
++},
++{"USE_SSL", "--enable-ssl", 
++#if USE_SSL
++1
++#else
++0
++#endif
++},
++{"USE_SSL", "--enable-ssl", 
++#if USE_SSL
++1
++#else
++0
++#endif
++},
++{"USE_SSL", "--enable-ssl", 
++#if USE_SSL
++1
++#else
++0
++#endif
++},
++{"USE_SSL", "--enable-ssl", 
++#if USE_SSL
++1
++#else
++0
++#endif
++},
++{"USE_SSL", "--enable-ssl", 
++#if USE_SSL
++1
++#else
++0
++#endif
++},
++{"USE_SSL", "--enable-ssl", 
++#if USE_SSL
++1
++#else
++0
++#endif
++},
++{"HTTP_VIOLATIONS", "--enable-http-violations", 
++#if HTTP_VIOLATIONS
++1
++#else
++0
++#endif
++},
++{"USE_USERAGENT_LOG", "--enable-useragent-log", 
++#if USE_USERAGENT_LOG
++1
++#else
++0
++#endif
++},
++{"USE_REFERER_LOG", "--enable-referer-log", 
++#if USE_REFERER_LOG
++1
++#else
++0
++#endif
++},
++{"WIP_FWD_LOG", "--enable-forward-log", 
++#if WIP_FWD_LOG
++1
++#else
++0
++#endif
++},
++{"USE_UNLINKD", "--enable-unlinkd", 
++#if USE_UNLINKD
++1
++#else
++0
++#endif
++},
++{"USE_ICMP", "--enable-icmp", 
++#if USE_ICMP
++1
++#else
++0
++#endif
++},
++{"HTTP_VIOLATIONS", "--enable-http-violations", 
++#if HTTP_VIOLATIONS
++1
++#else
++0
++#endif
++},
++{"HTTP_VIOLATIONS", "--enable-http-violations", 
++#if HTTP_VIOLATIONS
++1
++#else
++0
++#endif
++},
++{"HTTP_VIOLATIONS", "--enable-http-violations", 
++#if HTTP_VIOLATIONS
++1
++#else
++0
++#endif
++},
++{"USE_IDENT", "--enable-ident-lookups", 
++#if USE_IDENT
++1
++#else
++0
++#endif
++},
++{"DELAY_POOLS", "--enable-delay-pools", 
++#if DELAY_POOLS
++1
++#else
++0
++#endif
++},
++{"DELAY_POOLS", "--enable-delay-pools", 
++#if DELAY_POOLS
++1
++#else
++0
++#endif
++},
++{"DELAY_POOLS", "--enable-delay-pools", 
++#if DELAY_POOLS
++1
++#else
++0
++#endif
++},
++{"DELAY_POOLS", "--enable-delay-pools", 
++#if DELAY_POOLS
++1
++#else
++0
++#endif
++},
++{"DELAY_POOLS", "--enable-delay-pools", 
++#if DELAY_POOLS
++1
++#else
++0
++#endif
++},
++{"USE_WCCP", "--enable-wccp", 
++#if USE_WCCP
++1
++#else
++0
++#endif
++},
++{"USE_WCCPv2", "--enable-wccpv2", 
++#if USE_WCCPv2
++1
++#else
++0
++#endif
++},
++{"USE_WCCP", "--enable-wccp", 
++#if USE_WCCP
++1
++#else
++0
++#endif
++},
++{"USE_WCCPv2", "--enable-wccpv2", 
++#if USE_WCCPv2
++1
++#else
++0
++#endif
++},
++{"USE_WCCPv2", "--enable-wccpv2", 
++#if USE_WCCPv2
++1
++#else
++0
++#endif
++},
++{"USE_WCCPv2", "--enable-wccpv2", 
++#if USE_WCCPv2
++1
++#else
++0
++#endif
++},
++{"USE_WCCPv2", "--enable-wccpv2", 
++#if USE_WCCPv2
++1
++#else
++0
++#endif
++},
++{"USE_WCCPv2", "--enable-wccpv2", 
++#if USE_WCCPv2
++1
++#else
++0
++#endif
++},
++{"USE_WCCPv2", "--enable-wccpv2", 
++#if USE_WCCPv2
++1
++#else
++0
++#endif
++},
++{"USE_WCCPv2", "--enable-wccpv2", 
++#if USE_WCCPv2
++1
++#else
++0
++#endif
++},
++{"USE_WCCP", "--enable-wccp", 
++#if USE_WCCP
++1
++#else
++0
++#endif
++},
++{"USE_WCCPv2", "--enable-wccpv2", 
++#if USE_WCCPv2
++1
++#else
++0
++#endif
++},
++{"USE_CACHE_DIGESTS", "--enable-cache-digests", 
++#if USE_CACHE_DIGESTS
++1
++#else
++0
++#endif
++},
++{"USE_CACHE_DIGESTS", "--enable-cache-digests", 
++#if USE_CACHE_DIGESTS
++1
++#else
++0
++#endif
++},
++{"USE_CACHE_DIGESTS", "--enable-cache-digests", 
++#if USE_CACHE_DIGESTS
++1
++#else
++0
++#endif
++},
++{"USE_CACHE_DIGESTS", "--enable-cache-digests", 
++#if USE_CACHE_DIGESTS
++1
++#else
++0
++#endif
++},
++{"USE_CACHE_DIGESTS", "--enable-cache-digests", 
++#if USE_CACHE_DIGESTS
++1
++#else
++0
++#endif
++},
++{"USE_CACHE_DIGESTS", "--enable-cache-digests", 
++#if USE_CACHE_DIGESTS
++1
++#else
++0
++#endif
++},
++{"SQUID_SNMP", "--enable-snmp", 
++#if SQUID_SNMP
++1
++#else
++0
++#endif
++},
++{"SQUID_SNMP", "--enable-snmp", 
++#if SQUID_SNMP
++1
++#else
++0
++#endif
++},
++{"SQUID_SNMP", "--enable-snmp", 
++#if SQUID_SNMP
++1
++#else
++0
++#endif
++},
++{"SQUID_SNMP", "--enable-snmp", 
++#if SQUID_SNMP
++1
++#else
++0
++#endif
++},
++{"USE_HTCP", "--enable-htcp", 
++#if USE_HTCP
++1
++#else
++0
++#endif
++},
++{"MULTICAST_MISS_STREAM", "--enable-multicast-miss", 
++#if MULTICAST_MISS_STREAM
++1
++#else
++0
++#endif
++},
++{"MULTICAST_MISS_STREAM", "--enable-multicast-miss", 
++#if MULTICAST_MISS_STREAM
++1
++#else
++0
++#endif
++},
++{"MULTICAST_MISS_STREAM", "--enable-multicast-miss", 
++#if MULTICAST_MISS_STREAM
++1
++#else
++0
++#endif
++},
++{"MULTICAST_MISS_STREAM", "--enable-multicast-miss", 
++#if MULTICAST_MISS_STREAM
++1
++#else
++0
++#endif
++},
++{"HTTP_VIOLATIONS", "--enable-http-violations", 
++#if HTTP_VIOLATIONS
++1
++#else
++0
++#endif
++},
++{"USE_DNSSERVERS", "--disable-internal-dns", 
++#if USE_DNSSERVERS
++1
++#else
++0
++#endif
++},
++{"USE_DNSSERVERS", "--disable-internal-dns", 
++#if USE_DNSSERVERS
++1
++#else
++0
++#endif
++},
++{"!USE_DNSSERVERS", "--enable-internal-dns", 
++#if !USE_DNSSERVERS
++1
++#else
++0
++#endif
++},
++{"!USE_DNSSERVERS", "--enable-internal-dns", 
++#if !USE_DNSSERVERS
++1
++#else
++0
++#endif
++},
++{"HTTP_VIOLATIONS", "--enable-http-violations", 
++#if HTTP_VIOLATIONS
++1
++#else
++0
++#endif
++},
++{(void *)0L, 0}};
+diff -Naur squid-2.7.STABLE9-ori/src/cf_parser.h squid-2.7.STABLE9-new/src/cf_parser.h
+--- squid-2.7.STABLE9-ori/src/cf_parser.h	1970-01-01 08:00:00.000000000 +0800
++++ squid-2.7.STABLE9-new/src/cf_parser.h	2014-06-18 02:04:18.452232317 +0800
+@@ -0,0 +1,2011 @@
++/*
++ * Generated automatically from cf.data by ./cf_gen
++ *
++ * Abstract: This file contains routines used to configure the
++ *           variables in the squid server.
++ */
++
++static void
++default_line(const char *s)
++{
++	LOCAL_ARRAY(char, tmp_line, BUFSIZ);
++	xstrncpy(tmp_line, s, BUFSIZ);
++	xstrncpy(config_input_line, s, BUFSIZ);
++	config_lineno++;
++	parse_line(tmp_line);
++}
++static void
++default_all(void)
++{
++	cfg_filename = "Default Configuration";
++	config_lineno = 0;
++	/* No default for auth_param */
++	default_line("authenticate_cache_garbage_interval 1 hour");
++	default_line("authenticate_ttl 1 hour");
++	default_line("authenticate_ip_ttl 0 seconds");
++	default_line("authenticate_ip_shortcircuit_ttl 0 seconds");
++	/* No default for external_acl_type */
++	/* No default for acl */
++	/* No default for http_access */
++	/* No default for http_access2 */
++	/* No default for http_reply_access */
++	/* No default for icp_access */
++#if USE_HTCP
++	/* No default for htcp_access */
++#endif
++#if USE_HTCP
++	/* No default for htcp_clr_access */
++#endif
++	/* No default for miss_access */
++#if USE_IDENT
++	/* No default for ident_lookup_access */
++#endif
++	/* No default for reply_body_max_size */
++	/* No default for authenticate_ip_shortcircuit_access */
++#if FOLLOW_X_FORWARDED_FOR
++	/* No default for follow_x_forwarded_for */
++#endif
++#if FOLLOW_X_FORWARDED_FOR
++	default_line("acl_uses_indirect_client on");
++#endif
++#if FOLLOW_X_FORWARDED_FOR
++	default_line("delay_pool_uses_indirect_client on");
++#endif
++#if FOLLOW_X_FORWARDED_FOR
++	default_line("log_uses_indirect_client on");
++#endif
++#if USE_SSL
++	default_line("ssl_unclean_shutdown off");
++#endif
++#if USE_SSL
++	/* No default for ssl_engine */
++#endif
++#if USE_SSL
++	/* No default for sslproxy_client_certificate */
++#endif
++#if USE_SSL
++	/* No default for sslproxy_client_key */
++#endif
++#if USE_SSL
++	default_line("sslproxy_version 1");
++#endif
++#if USE_SSL
++	/* No default for sslproxy_options */
++#endif
++#if USE_SSL
++	/* No default for sslproxy_cipher */
++#endif
++#if USE_SSL
++	/* No default for sslproxy_cafile */
++#endif
++#if USE_SSL
++	/* No default for sslproxy_capath */
++#endif
++#if USE_SSL
++	/* No default for sslproxy_flags */
++#endif
++#if USE_SSL
++	/* No default for sslpassword_program */
++#endif
++	/* No default for http_port */
++#if USE_SSL
++	/* No default for https_port */
++#endif
++	/* No default for tcp_outgoing_tos */
++	/* No default for tcp_outgoing_address */
++	default_line("zph_mode off");
++	default_line("zph_local 0");
++	default_line("zph_sibling 0");
++	default_line("zph_parent 0");
++	default_line("zph_option 136");
++	/* No default for cache_peer */
++	/* No default for cache_peer_domain */
++	/* No default for cache_peer_access */
++	/* No default for neighbor_type_domain */
++	default_line("dead_peer_timeout 10 seconds");
++	/* No default for hierarchy_stoplist */
++	default_line("cache_mem 8 MB");
++	default_line("maximum_object_size_in_memory 8 KB");
++	default_line("memory_replacement_policy lru");
++	default_line("cache_replacement_policy lru");
++	/* No default for cache_dir */
++	default_line("store_dir_select_algorithm least-load");
++	default_line("max_open_disk_fds 0");
++	default_line("minimum_object_size 0 KB");
++	default_line("maximum_object_size 4096 KB");
++	default_line("cache_swap_low 90");
++	default_line("cache_swap_high 95");
++#if HTTP_VIOLATIONS
++	default_line("update_headers on");
++#endif
++	/* No default for logformat */
++	/* No default for access_log */
++	/* No default for log_access */
++	default_line("logfile_daemon /usr/local/squid/libexec/logfile-daemon");
++	default_line("cache_log /usr/local/squid/var/logs/cache.log");
++	default_line("cache_store_log /usr/local/squid/var/logs/store.log");
++	/* No default for cache_swap_state */
++	default_line("logfile_rotate 10");
++	default_line("emulate_httpd_log off");
++	default_line("log_ip_on_direct on");
++	default_line("mime_table /usr/local/squid/etc/mime.conf");
++	default_line("log_mime_hdrs off");
++#if USE_USERAGENT_LOG
++	/* No default for useragent_log */
++#endif
++#if USE_REFERER_LOG
++	/* No default for referer_log */
++#endif
++	default_line("pid_filename /usr/local/squid/var/logs/squid.pid");
++	default_line("debug_options ALL,1");
++	default_line("log_fqdn off");
++	default_line("client_netmask 255.255.255.255");
++#if WIP_FWD_LOG
++	/* No default for forward_log */
++#endif
++	default_line("strip_query_terms on");
++	default_line("buffered_logs off");
++	default_line("netdb_filename /usr/local/squid/var/logs/netdb.state");
++	default_line("ftp_user Squid@");
++	default_line("ftp_list_width 32");
++	default_line("ftp_passive on");
++	default_line("ftp_sanitycheck on");
++	default_line("ftp_telnet_protocol on");
++	default_line("diskd_program /usr/local/squid/libexec/diskd-daemon");
++#if USE_UNLINKD
++	default_line("unlinkd_program /usr/local/squid/libexec/unlinkd");
++#endif
++#if USE_ICMP
++	default_line("pinger_program /usr/local/squid/libexec/pinger");
++#endif
++	/* No default for storeurl_rewrite_program */
++	default_line("storeurl_rewrite_children 5");
++	default_line("storeurl_rewrite_concurrency 0");
++	/* No default for url_rewrite_program */
++	default_line("url_rewrite_children 5");
++	default_line("url_rewrite_concurrency 0");
++	default_line("url_rewrite_host_header on");
++	/* No default for url_rewrite_access */
++	/* No default for storeurl_access */
++	default_line("redirector_bypass off");
++	/* No default for location_rewrite_program */
++	default_line("location_rewrite_children 5");
++	default_line("location_rewrite_concurrency 0");
++	/* No default for location_rewrite_access */
++	/* No default for cache */
++	default_line("max_stale 1 week");
++	/* No default for refresh_pattern */
++	default_line("quick_abort_min 16 KB");
++	default_line("quick_abort_max 16 KB");
++	default_line("quick_abort_pct 95");
++	default_line("read_ahead_gap 16 KB");
++	default_line("negative_ttl 5 minutes");
++	default_line("positive_dns_ttl 6 hours");
++	default_line("negative_dns_ttl 1 minute");
++	default_line("range_offset_limit 0 KB");
++	default_line("minimum_expiry_time 60 seconds");
++	default_line("store_avg_object_size 13 KB");
++	default_line("store_objects_per_bucket 20");
++	default_line("request_header_max_size 20 KB");
++	default_line("reply_header_max_size 20 KB");
++	default_line("request_body_max_size 0 KB");
++	/* No default for broken_posts */
++	/* No default for upgrade_http0.9 */
++#if HTTP_VIOLATIONS
++	default_line("via on");
++#endif
++	default_line("cache_vary on");
++	/* No default for broken_vary_encoding */
++	default_line("collapsed_forwarding off");
++	default_line("refresh_stale_hit 0 seconds");
++	default_line("ie_refresh off");
++	default_line("vary_ignore_expire off");
++	/* No default for extension_methods */
++	default_line("request_entities off");
++#if HTTP_VIOLATIONS
++	/* No default for header_access */
++#endif
++#if HTTP_VIOLATIONS
++	/* No default for header_replace */
++#endif
++	default_line("relaxed_header_parser on");
++	default_line("server_http11 off");
++	default_line("ignore_expect_100 off");
++	/* No default for external_refresh_check */
++	default_line("forward_timeout 4 minutes");
++	default_line("connect_timeout 1 minute");
++	default_line("peer_connect_timeout 30 seconds");
++	default_line("read_timeout 15 minutes");
++	default_line("request_timeout 5 minutes");
++	default_line("persistent_request_timeout 2 minutes");
++	default_line("client_lifetime 1 day");
++	default_line("half_closed_clients on");
++	default_line("pconn_timeout 1 minute");
++#if USE_IDENT
++	default_line("ident_timeout 10 seconds");
++#endif
++	default_line("shutdown_lifetime 30 seconds");
++	default_line("cache_mgr webmaster");
++	/* No default for mail_from */
++	default_line("mail_program mail");
++	default_line("cache_effective_user nobody");
++	/* No default for cache_effective_group */
++	default_line("httpd_suppress_version_string off");
++	/* No default for visible_hostname */
++	/* No default for unique_hostname */
++	/* No default for hostname_aliases */
++	default_line("umask 027");
++	default_line("announce_period 0");
++	default_line("announce_host tracker.ircache.net");
++	/* No default for announce_file */
++	default_line("announce_port 3131");
++	default_line("httpd_accel_no_pmtu_disc off");
++#if DELAY_POOLS
++	default_line("delay_pools 0");
++#endif
++#if DELAY_POOLS
++	/* No default for delay_class */
++#endif
++#if DELAY_POOLS
++	/* No default for delay_access */
++#endif
++#if DELAY_POOLS
++	/* No default for delay_parameters */
++#endif
++#if DELAY_POOLS
++	default_line("delay_initial_bucket_level 50");
++#endif
++#if USE_WCCP
++	default_line("wccp_router 0.0.0.0");
++#endif
++#if USE_WCCPv2
++	/* No default for wccp2_router */
++#endif
++#if USE_WCCP
++	default_line("wccp_version 4");
++#endif
++#if USE_WCCPv2
++	default_line("wccp2_rebuild_wait on");
++#endif
++#if USE_WCCPv2
++	default_line("wccp2_forwarding_method 1");
++#endif
++#if USE_WCCPv2
++	default_line("wccp2_return_method 1");
++#endif
++#if USE_WCCPv2
++	default_line("wccp2_assignment_method 1");
++#endif
++#if USE_WCCPv2
++	/* No default for wccp2_service */
++#endif
++#if USE_WCCPv2
++	/* No default for wccp2_service_info */
++#endif
++#if USE_WCCPv2
++	default_line("wccp2_weight 10000");
++#endif
++#if USE_WCCP
++	default_line("wccp_address 0.0.0.0");
++#endif
++#if USE_WCCPv2
++	default_line("wccp2_address 0.0.0.0");
++#endif
++	default_line("client_persistent_connections on");
++	default_line("server_persistent_connections on");
++	default_line("persistent_connection_after_error off");
++	default_line("detect_broken_pconn off");
++#if USE_CACHE_DIGESTS
++	default_line("digest_generation on");
++#endif
++#if USE_CACHE_DIGESTS
++	default_line("digest_bits_per_entry 5");
++#endif
++#if USE_CACHE_DIGESTS
++	default_line("digest_rebuild_period 1 hour");
++#endif
++#if USE_CACHE_DIGESTS
++	default_line("digest_rewrite_period 1 hour");
++#endif
++#if USE_CACHE_DIGESTS
++	default_line("digest_swapout_chunk_size 4096 bytes");
++#endif
++#if USE_CACHE_DIGESTS
++	default_line("digest_rebuild_chunk_percentage 10");
++#endif
++#if SQUID_SNMP
++	default_line("snmp_port 3401");
++#endif
++#if SQUID_SNMP
++	/* No default for snmp_access */
++#endif
++#if SQUID_SNMP
++	default_line("snmp_incoming_address 0.0.0.0");
++#endif
++#if SQUID_SNMP
++	default_line("snmp_outgoing_address 255.255.255.255");
++#endif
++	default_line("icp_port 3130");
++#if USE_HTCP
++	default_line("htcp_port 4827");
++#endif
++	default_line("log_icp_queries on");
++	default_line("udp_incoming_address 0.0.0.0");
++	default_line("udp_outgoing_address 255.255.255.255");
++	default_line("icp_hit_stale off");
++	default_line("minimum_direct_hops 4");
++	default_line("minimum_direct_rtt 400");
++	default_line("netdb_low 900");
++	default_line("netdb_high 1000");
++	default_line("netdb_ping_period 5 minutes");
++	default_line("query_icmp off");
++	default_line("test_reachability off");
++	default_line("icp_query_timeout 0");
++	default_line("maximum_icp_query_timeout 2000");
++	default_line("minimum_icp_query_timeout 5");
++	/* No default for mcast_groups */
++#if MULTICAST_MISS_STREAM
++	default_line("mcast_miss_addr 255.255.255.255");
++#endif
++#if MULTICAST_MISS_STREAM
++	default_line("mcast_miss_ttl 16");
++#endif
++#if MULTICAST_MISS_STREAM
++	default_line("mcast_miss_port 3135");
++#endif
++#if MULTICAST_MISS_STREAM
++	default_line("mcast_miss_encode_key XXXXXXXXXXXXXXXX");
++#endif
++	default_line("mcast_icp_query_timeout 2000");
++	default_line("icon_directory /usr/local/squid/share/icons");
++	default_line("global_internal_static on");
++	default_line("short_icon_urls off");
++	default_line("error_directory /usr/local/squid/share/errors/English");
++	/* No default for error_map */
++	/* No default for err_html_text */
++	/* No default for deny_info */
++	default_line("nonhierarchical_direct on");
++	default_line("prefer_direct off");
++#if HTTP_VIOLATIONS
++	default_line("ignore_ims_on_miss off");
++#endif
++	/* No default for always_direct */
++	/* No default for never_direct */
++	default_line("max_filedescriptors 0");
++	/* No default for accept_filter */
++	default_line("tcp_recv_bufsize 0 bytes");
++	default_line("incoming_rate 30");
++	default_line("check_hostnames on");
++	default_line("allow_underscore on");
++#if USE_DNSSERVERS
++	default_line("cache_dns_program /usr/local/squid/libexec/dnsserver");
++#endif
++#if USE_DNSSERVERS
++	default_line("dns_children 5");
++#endif
++#if !USE_DNSSERVERS
++	default_line("dns_retransmit_interval 5 seconds");
++#endif
++#if !USE_DNSSERVERS
++	default_line("dns_timeout 2 minutes");
++#endif
++	default_line("dns_defnames off");
++	/* No default for dns_nameservers */
++	default_line("hosts_file /etc/hosts");
++	/* No default for dns_testnames */
++	/* No default for append_domain */
++	default_line("ignore_unknown_nameservers on");
++	default_line("ipcache_size 1024");
++	default_line("ipcache_low 90");
++	default_line("ipcache_high 95");
++	default_line("fqdncache_size 1024");
++	default_line("memory_pools on");
++	default_line("memory_pools_limit 5 MB");
++	default_line("forwarded_for on");
++	/* No default for cachemgr_passwd */
++	default_line("client_db on");
++#if HTTP_VIOLATIONS
++	default_line("reload_into_ims off");
++#endif
++	default_line("maximum_single_addr_tries 1");
++	default_line("retry_on_error off");
++	default_line("as_whois_server whois.ra.net");
++	default_line("offline_mode off");
++	default_line("uri_whitespace strip");
++	/* No default for coredump_dir */
++	/* No default for chroot */
++	default_line("balance_on_multiple_ip on");
++	default_line("pipeline_prefetch off");
++	default_line("high_response_time_warning 0");
++	default_line("high_page_fault_warning 0");
++	default_line("high_memory_warning 0 KB");
++	default_line("sleep_after_fork 0");
++	default_line("zero_buffers on");
++	default_line("windows_ipaddrchangemonitor on");
++	cfg_filename = NULL;
++}
++
++static void
++defaults_if_none(void)
++{
++	if (check_null_acl_access(Config.accessList.http)) {
++		default_line("http_access deny all");
++	}
++	if (check_null_acl_access(Config.accessList.reply)) {
++		default_line("http_reply_access allow all");
++	}
++	if (check_null_acl_access(Config.accessList.icp)) {
++		default_line("icp_access deny all");
++	}
++#if USE_HTCP
++	if (check_null_acl_access(Config.accessList.htcp)) {
++		default_line("htcp_access deny all");
++	}
++#endif
++#if USE_HTCP
++	if (check_null_acl_access(Config.accessList.htcp_clr)) {
++		default_line("htcp_clr_access deny all");
++	}
++#endif
++#if USE_IDENT
++	if (check_null_acl_access(Config.accessList.identLookup)) {
++		default_line("ident_lookup_access deny all");
++	}
++#endif
++	if (check_null_body_size_t(Config.ReplyBodySize)) {
++		default_line("reply_body_max_size 0 allow all");
++	}
++#if FOLLOW_X_FORWARDED_FOR
++	if (check_null_acl_access(Config.accessList.followXFF)) {
++		default_line("follow_x_forwarded_for deny all");
++	}
++#endif
++	if (check_null_cachedir(Config.cacheSwap)) {
++		default_line("cache_dir ufs /usr/local/squid/var/cache 100 16 256");
++	}
++#if USE_WCCPv2
++	if (check_null_wccp2_service(Config.Wccp2.info)) {
++		default_line("wccp2_service standard 0");
++	}
++#endif
++#if SQUID_SNMP
++	if (check_null_acl_access(Config.accessList.snmp)) {
++		default_line("snmp_access deny all");
++	}
++#endif
++	if (check_null_wordlist(Config.dns_testname_list)) {
++		default_line("dns_testnames netscape.com internic.net nlanr.net microsoft.com");
++	}
++	if (check_null_string(Config.as_whois_server)) {
++		default_line("as_whois_server whois.ra.net");
++	}
++	if (check_null_string(Config.coredump_dir)) {
++		default_line("coredump_dir none");
++	}
++}
++
++static int
++parse_line(char *buff)
++{
++	int	result = 1;
++	char	*token;
++	debug(0,10)("parse_line: %s\n", buff);
++	if ((token = strtok(buff, w_space)) == NULL)
++		(void) 0;	/* ignore empty lines */
++	else if (!strcmp(token, "auth_param"))
++		parse_authparam(&Config.authConfig);
++	else if (!strcmp(token, "authenticate_cache_garbage_interval"))
++		parse_time_t(&Config.authenticateGCInterval);
++	else if (!strcmp(token, "authenticate_ttl"))
++		parse_time_t(&Config.authenticateTTL);
++	else if (!strcmp(token, "authenticate_ip_ttl"))
++		parse_time_t(&Config.authenticateIpTTL);
++	else if (!strcmp(token, "authenticate_ip_shortcircuit_ttl"))
++		parse_time_t(&Config.authenticateIpShortcircuitTTL);
++	else if (!strcmp(token, "external_acl_type"))
++		parse_externalAclHelper(&Config.externalAclHelperList);
++	else if (!strcmp(token, "acl"))
++		parse_acl(&Config.aclList);
++	else if (!strcmp(token, "http_access"))
++		parse_acl_access(&Config.accessList.http);
++	else if (!strcmp(token, "http_access2"))
++		parse_acl_access(&Config.accessList.http2);
++	else if (!strcmp(token, "http_reply_access"))
++		parse_acl_access(&Config.accessList.reply);
++	else if (!strcmp(token, "icp_access"))
++		parse_acl_access(&Config.accessList.icp);
++#if USE_HTCP
++	else if (!strcmp(token, "htcp_access"))
++		parse_acl_access(&Config.accessList.htcp);
++#endif
++#if USE_HTCP
++	else if (!strcmp(token, "htcp_clr_access"))
++		parse_acl_access(&Config.accessList.htcp_clr);
++#endif
++	else if (!strcmp(token, "miss_access"))
++		parse_acl_access(&Config.accessList.miss);
++#if USE_IDENT
++	else if (!strcmp(token, "ident_lookup_access"))
++		parse_acl_access(&Config.accessList.identLookup);
++#endif
++	else if (!strcmp(token, "reply_body_max_size"))
++		parse_body_size_t(&Config.ReplyBodySize);
++	else if (!strcmp(token, "authenticate_ip_shortcircuit_access"))
++		parse_acl_access(&Config.accessList.auth_ip_shortcircuit);
++#if FOLLOW_X_FORWARDED_FOR
++	else if (!strcmp(token, "follow_x_forwarded_for"))
++		parse_acl_access(&Config.accessList.followXFF);
++#endif
++#if FOLLOW_X_FORWARDED_FOR
++	else if (!strcmp(token, "acl_uses_indirect_client"))
++		parse_onoff(&Config.onoff.acl_uses_indirect_client);
++#endif
++#if FOLLOW_X_FORWARDED_FOR
++	else if (!strcmp(token, "delay_pool_uses_indirect_client"))
++		parse_onoff(&Config.onoff.delay_pool_uses_indirect_client);
++#endif
++#if FOLLOW_X_FORWARDED_FOR
++	else if (!strcmp(token, "log_uses_indirect_client"))
++		parse_onoff(&Config.onoff.log_uses_indirect_client);
++#endif
++#if USE_SSL
++	else if (!strcmp(token, "ssl_unclean_shutdown"))
++		parse_onoff(&Config.SSL.unclean_shutdown);
++#endif
++#if USE_SSL
++	else if (!strcmp(token, "ssl_engine"))
++		parse_string(&Config.SSL.ssl_engine);
++#endif
++#if USE_SSL
++	else if (!strcmp(token, "sslproxy_client_certificate"))
++		parse_string(&Config.ssl_client.cert);
++#endif
++#if USE_SSL
++	else if (!strcmp(token, "sslproxy_client_key"))
++		parse_string(&Config.ssl_client.key);
++#endif
++#if USE_SSL
++	else if (!strcmp(token, "sslproxy_version"))
++		parse_int(&Config.ssl_client.version);
++#endif
++#if USE_SSL
++	else if (!strcmp(token, "sslproxy_options"))
++		parse_string(&Config.ssl_client.options);
++#endif
++#if USE_SSL
++	else if (!strcmp(token, "sslproxy_cipher"))
++		parse_string(&Config.ssl_client.cipher);
++#endif
++#if USE_SSL
++	else if (!strcmp(token, "sslproxy_cafile"))
++		parse_string(&Config.ssl_client.cafile);
++#endif
++#if USE_SSL
++	else if (!strcmp(token, "sslproxy_capath"))
++		parse_string(&Config.ssl_client.capath);
++#endif
++#if USE_SSL
++	else if (!strcmp(token, "sslproxy_flags"))
++		parse_string(&Config.ssl_client.flags);
++#endif
++#if USE_SSL
++	else if (!strcmp(token, "sslpassword_program"))
++		parse_string(&Config.Program.ssl_password);
++#endif
++	else if (!strcmp(token, "http_port"))
++		parse_http_port_list(&Config.Sockaddr.http);
++	else if (!strcmp(token, "ascii_port"))
++		parse_http_port_list(&Config.Sockaddr.http);
++#if USE_SSL
++	else if (!strcmp(token, "https_port"))
++		parse_https_port_list(&Config.Sockaddr.https);
++#endif
++	else if (!strcmp(token, "tcp_outgoing_tos"))
++		parse_acl_tos(&Config.accessList.outgoing_tos);
++	else if (!strcmp(token, "tcp_outgoing_dscp"))
++		parse_acl_tos(&Config.accessList.outgoing_tos);
++	else if (!strcmp(token, "tcp_outgoing_ds"))
++		parse_acl_tos(&Config.accessList.outgoing_tos);
++	else if (!strcmp(token, "tcp_outgoing_address"))
++		parse_acl_address(&Config.accessList.outgoing_address);
++	else if (!strcmp(token, "zph_mode"))
++		parse_zph_mode(&Config.zph_mode);
++	else if (!strcmp(token, "zph_local"))
++		parse_int(&Config.zph_local);
++	else if (!strcmp(token, "zph_sibling"))
++		parse_int(&Config.zph_sibling);
++	else if (!strcmp(token, "zph_parent"))
++		parse_int(&Config.zph_parent);
++	else if (!strcmp(token, "zph_option"))
++		parse_int(&Config.zph_option);
++	else if (!strcmp(token, "cache_peer"))
++		parse_peer(&Config.peers);
++	else if (!strcmp(token, "cache_peer_domain"))
++		parse_hostdomain();
++	else if (!strcmp(token, "cache_host_domain"))
++		parse_hostdomain();
++	else if (!strcmp(token, "cache_peer_access"))
++		parse_peer_access();
++	else if (!strcmp(token, "neighbor_type_domain"))
++		parse_hostdomaintype();
++	else if (!strcmp(token, "dead_peer_timeout"))
++		parse_time_t(&Config.Timeout.deadPeer);
++	else if (!strcmp(token, "hierarchy_stoplist"))
++		parse_wordlist(&Config.hierarchy_stoplist);
++	else if (!strcmp(token, "cache_mem"))
++		parse_b_size_t(&Config.memMaxSize);
++	else if (!strcmp(token, "maximum_object_size_in_memory"))
++		parse_b_size_t(&Config.Store.maxInMemObjSize);
++	else if (!strcmp(token, "memory_replacement_policy"))
++		parse_removalpolicy(&Config.memPolicy);
++	else if (!strcmp(token, "cache_replacement_policy"))
++		parse_removalpolicy(&Config.replPolicy);
++	else if (!strcmp(token, "cache_dir"))
++		parse_cachedir(&Config.cacheSwap);
++	else if (!strcmp(token, "store_dir_select_algorithm"))
++		parse_string(&Config.store_dir_select_algorithm);
++	else if (!strcmp(token, "max_open_disk_fds"))
++		parse_int(&Config.max_open_disk_fds);
++	else if (!strcmp(token, "minimum_object_size"))
++		parse_b_size_t(&Config.Store.minObjectSize);
++	else if (!strcmp(token, "maximum_object_size"))
++		parse_b_size_t(&Config.Store.maxObjectSize);
++	else if (!strcmp(token, "cache_swap_low"))
++		parse_int(&Config.Swap.lowWaterMark);
++	else if (!strcmp(token, "cache_swap_high"))
++		parse_int(&Config.Swap.highWaterMark);
++#if HTTP_VIOLATIONS
++	else if (!strcmp(token, "update_headers"))
++		parse_onoff(&Config.onoff.update_headers);
++#endif
++	else if (!strcmp(token, "logformat"))
++		parse_logformat(&Config.Log.logformats);
++	else if (!strcmp(token, "access_log"))
++		parse_access_log(&Config.Log.accesslogs);
++	else if (!strcmp(token, "cache_access_log"))
++		parse_access_log(&Config.Log.accesslogs);
++	else if (!strcmp(token, "log_access"))
++		parse_acl_access(&Config.accessList.log);
++	else if (!strcmp(token, "logfile_daemon"))
++		parse_string(&Config.Program.logfile_daemon);
++	else if (!strcmp(token, "cache_log"))
++		parse_string(&Config.Log.log);
++	else if (!strcmp(token, "cache_store_log"))
++		parse_string(&Config.Log.store);
++	else if (!strcmp(token, "cache_swap_state"))
++		parse_string(&Config.Log.swap);
++	else if (!strcmp(token, "cache_swap_log"))
++		parse_string(&Config.Log.swap);
++	else if (!strcmp(token, "logfile_rotate"))
++		parse_int(&Config.Log.rotateNumber);
++	else if (!strcmp(token, "emulate_httpd_log"))
++		parse_onoff(&Config.onoff.common_log);
++	else if (!strcmp(token, "log_ip_on_direct"))
++		parse_onoff(&Config.onoff.log_ip_on_direct);
++	else if (!strcmp(token, "mime_table"))
++		parse_string(&Config.mimeTablePathname);
++	else if (!strcmp(token, "log_mime_hdrs"))
++		parse_onoff(&Config.onoff.log_mime_hdrs);
++#if USE_USERAGENT_LOG
++	else if (!strcmp(token, "useragent_log"))
++		parse_string(&Config.Log.useragent);
++#endif
++#if USE_REFERER_LOG
++	else if (!strcmp(token, "referer_log"))
++		parse_string(&Config.Log.referer);
++	else if (!strcmp(token, "referrer_log"))
++		parse_string(&Config.Log.referer);
++#endif
++	else if (!strcmp(token, "pid_filename"))
++		parse_string(&Config.pidFilename);
++	else if (!strcmp(token, "debug_options"))
++		parse_eol(&Config.debugOptions);
++	else if (!strcmp(token, "log_fqdn"))
++		parse_onoff(&Config.onoff.log_fqdn);
++	else if (!strcmp(token, "client_netmask"))
++		parse_address(&Config.Addrs.client_netmask);
++#if WIP_FWD_LOG
++	else if (!strcmp(token, "forward_log"))
++		parse_string(&Config.Log.forward);
++#endif
++	else if (!strcmp(token, "strip_query_terms"))
++		parse_onoff(&Config.onoff.strip_query_terms);
++	else if (!strcmp(token, "buffered_logs"))
++		parse_onoff(&Config.onoff.buffered_logs);
++	else if (!strcmp(token, "netdb_filename"))
++		parse_string(&Config.netdbFilename);
++	else if (!strcmp(token, "ftp_user"))
++		parse_string(&Config.Ftp.anon_user);
++	else if (!strcmp(token, "ftp_list_width"))
++		parse_int(&Config.Ftp.list_width);
++	else if (!strcmp(token, "ftp_passive"))
++		parse_onoff(&Config.Ftp.passive);
++	else if (!strcmp(token, "ftp_sanitycheck"))
++		parse_onoff(&Config.Ftp.sanitycheck);
++	else if (!strcmp(token, "ftp_telnet_protocol"))
++		parse_onoff(&Config.Ftp.telnet);
++	else if (!strcmp(token, "diskd_program"))
++		parse_string(&Config.Program.diskd);
++#if USE_UNLINKD
++	else if (!strcmp(token, "unlinkd_program"))
++		parse_string(&Config.Program.unlinkd);
++#endif
++#if USE_ICMP
++	else if (!strcmp(token, "pinger_program"))
++		parse_string(&Config.Program.pinger);
++#endif
++	else if (!strcmp(token, "storeurl_rewrite_program"))
++		parse_programline(&Config.Program.store_rewrite.command);
++	else if (!strcmp(token, "storeurl_rewrite_children"))
++		parse_int(&Config.Program.store_rewrite.children);
++	else if (!strcmp(token, "storeurl_rewrite_concurrency"))
++		parse_int(&Config.Program.store_rewrite.concurrency);
++	else if (!strcmp(token, "url_rewrite_program"))
++		parse_programline(&Config.Program.url_rewrite.command);
++	else if (!strcmp(token, "redirect_program"))
++		parse_programline(&Config.Program.url_rewrite.command);
++	else if (!strcmp(token, "url_rewrite_children"))
++		parse_int(&Config.Program.url_rewrite.children);
++	else if (!strcmp(token, "redirect_children"))
++		parse_int(&Config.Program.url_rewrite.children);
++	else if (!strcmp(token, "url_rewrite_concurrency"))
++		parse_int(&Config.Program.url_rewrite.concurrency);
++	else if (!strcmp(token, "redirect_concurrency"))
++		parse_int(&Config.Program.url_rewrite.concurrency);
++	else if (!strcmp(token, "url_rewrite_host_header"))
++		parse_onoff(&Config.onoff.redir_rewrites_host);
++	else if (!strcmp(token, "redirect_rewrites_host_header"))
++		parse_onoff(&Config.onoff.redir_rewrites_host);
++	else if (!strcmp(token, "url_rewrite_access"))
++		parse_acl_access(&Config.accessList.url_rewrite);
++	else if (!strcmp(token, "redirector_access"))
++		parse_acl_access(&Config.accessList.url_rewrite);
++	else if (!strcmp(token, "storeurl_access"))
++		parse_acl_access(&Config.accessList.storeurl_rewrite);
++	else if (!strcmp(token, "redirector_bypass"))
++		parse_onoff(&Config.onoff.redirector_bypass);
++	else if (!strcmp(token, "location_rewrite_program"))
++		parse_programline(&Config.Program.location_rewrite.command);
++	else if (!strcmp(token, "location_rewrite_children"))
++		parse_int(&Config.Program.location_rewrite.children);
++	else if (!strcmp(token, "location_rewrite_concurrency"))
++		parse_int(&Config.Program.location_rewrite.concurrency);
++	else if (!strcmp(token, "location_rewrite_access"))
++		parse_acl_access(&Config.accessList.location_rewrite);
++	else if (!strcmp(token, "cache"))
++		parse_acl_access(&Config.accessList.noCache);
++	else if (!strcmp(token, "no_cache"))
++		parse_acl_access(&Config.accessList.noCache);
++	else if (!strcmp(token, "max_stale"))
++		parse_time_t(&Config.maxStale);
++	else if (!strcmp(token, "refresh_pattern"))
++		parse_refreshpattern(&Config.Refresh);
++	else if (!strcmp(token, "quick_abort_min"))
++		parse_kb_size_t(&Config.quickAbort.min);
++	else if (!strcmp(token, "quick_abort_max"))
++		parse_kb_size_t(&Config.quickAbort.max);
++	else if (!strcmp(token, "quick_abort_pct"))
++		parse_int(&Config.quickAbort.pct);
++	else if (!strcmp(token, "read_ahead_gap"))
++		parse_b_size_t(&Config.readAheadGap);
++	else if (!strcmp(token, "negative_ttl"))
++		parse_time_t(&Config.negativeTtl);
++	else if (!strcmp(token, "positive_dns_ttl"))
++		parse_time_t(&Config.positiveDnsTtl);
++	else if (!strcmp(token, "negative_dns_ttl"))
++		parse_time_t(&Config.negativeDnsTtl);
++	else if (!strcmp(token, "range_offset_limit"))
++		parse_b_size_t(&Config.rangeOffsetLimit);
++	else if (!strcmp(token, "minimum_expiry_time"))
++		parse_time_t(&Config.minimum_expiry_time);
++	else if (!strcmp(token, "store_avg_object_size"))
++		parse_kb_size_t(&Config.Store.avgObjectSize);
++	else if (!strcmp(token, "store_objects_per_bucket"))
++		parse_int(&Config.Store.objectsPerBucket);
++	else if (!strcmp(token, "request_header_max_size"))
++		parse_b_size_t(&Config.maxRequestHeaderSize);
++	else if (!strcmp(token, "reply_header_max_size"))
++		parse_b_size_t(&Config.maxReplyHeaderSize);
++	else if (!strcmp(token, "request_body_max_size"))
++		parse_b_size_t(&Config.maxRequestBodySize);
++	else if (!strcmp(token, "broken_posts"))
++		parse_acl_access(&Config.accessList.brokenPosts);
++	else if (!strcmp(token, "upgrade_http0.9"))
++		parse_acl_access(&Config.accessList.upgrade_http09);
++#if HTTP_VIOLATIONS
++	else if (!strcmp(token, "via"))
++		parse_onoff(&Config.onoff.via);
++#endif
++	else if (!strcmp(token, "cache_vary"))
++		parse_onoff(&Config.onoff.cache_vary);
++	else if (!strcmp(token, "broken_vary_encoding"))
++		parse_acl_access(&Config.accessList.vary_encoding);
++	else if (!strcmp(token, "collapsed_forwarding"))
++		parse_onoff(&Config.onoff.collapsed_forwarding);
++	else if (!strcmp(token, "refresh_stale_hit"))
++		parse_time_t(&Config.refresh_stale_window);
++	else if (!strcmp(token, "ie_refresh"))
++		parse_onoff(&Config.onoff.ie_refresh);
++	else if (!strcmp(token, "vary_ignore_expire"))
++		parse_onoff(&Config.onoff.vary_ignore_expire);
++	else if (!strcmp(token, "extension_methods"))
++		parse_extension_method(&RequestMethods);
++	else if (!strcmp(token, "request_entities"))
++		parse_onoff(&Config.onoff.request_entities);
++#if HTTP_VIOLATIONS
++	else if (!strcmp(token, "header_access"))
++		parse_http_header_access(&Config.header_access[0]);
++#endif
++#if HTTP_VIOLATIONS
++	else if (!strcmp(token, "header_replace"))
++		parse_http_header_replace(&Config.header_access[0]);
++#endif
++	else if (!strcmp(token, "relaxed_header_parser"))
++		parse_tristate(&Config.onoff.relaxed_header_parser);
++	else if (!strcmp(token, "server_http11"))
++		parse_onoff(&Config.onoff.server_http11);
++	else if (!strcmp(token, "ignore_expect_100"))
++		parse_onoff(&Config.onoff.ignore_expect_100);
++	else if (!strcmp(token, "external_refresh_check"))
++		parse_refreshCheckHelper(&Config.Program.refresh_check);
++	else if (!strcmp(token, "forward_timeout"))
++		parse_time_t(&Config.Timeout.forward);
++	else if (!strcmp(token, "connect_timeout"))
++		parse_time_t(&Config.Timeout.connect);
++	else if (!strcmp(token, "peer_connect_timeout"))
++		parse_time_t(&Config.Timeout.peer_connect);
++	else if (!strcmp(token, "read_timeout"))
++		parse_time_t(&Config.Timeout.read);
++	else if (!strcmp(token, "request_timeout"))
++		parse_time_t(&Config.Timeout.request);
++	else if (!strcmp(token, "persistent_request_timeout"))
++		parse_time_t(&Config.Timeout.persistent_request);
++	else if (!strcmp(token, "client_lifetime"))
++		parse_time_t(&Config.Timeout.lifetime);
++	else if (!strcmp(token, "half_closed_clients"))
++		parse_onoff(&Config.onoff.half_closed_clients);
++	else if (!strcmp(token, "pconn_timeout"))
++		parse_time_t(&Config.Timeout.pconn);
++#if USE_IDENT
++	else if (!strcmp(token, "ident_timeout"))
++		parse_time_t(&Config.Timeout.ident);
++#endif
++	else if (!strcmp(token, "shutdown_lifetime"))
++		parse_time_t(&Config.shutdownLifetime);
++	else if (!strcmp(token, "cache_mgr"))
++		parse_string(&Config.adminEmail);
++	else if (!strcmp(token, "mail_from"))
++		parse_string(&Config.EmailFrom);
++	else if (!strcmp(token, "mail_program"))
++		parse_eol(&Config.EmailProgram);
++	else if (!strcmp(token, "cache_effective_user"))
++		parse_string(&Config.effectiveUser);
++	else if (!strcmp(token, "cache_effective_group"))
++		parse_string(&Config.effectiveGroup);
++	else if (!strcmp(token, "httpd_suppress_version_string"))
++		parse_onoff(&Config.onoff.httpd_suppress_version_string);
++	else if (!strcmp(token, "visible_hostname"))
++		parse_string(&Config.visibleHostname);
++	else if (!strcmp(token, "unique_hostname"))
++		parse_string(&Config.uniqueHostname);
++	else if (!strcmp(token, "hostname_aliases"))
++		parse_wordlist(&Config.hostnameAliases);
++	else if (!strcmp(token, "umask"))
++		parse_int(&Config.umask);
++	else if (!strcmp(token, "announce_period"))
++		parse_time_t(&Config.Announce.period);
++	else if (!strcmp(token, "announce_host"))
++		parse_string(&Config.Announce.host);
++	else if (!strcmp(token, "announce_file"))
++		parse_string(&Config.Announce.file);
++	else if (!strcmp(token, "announce_port"))
++		parse_ushort(&Config.Announce.port);
++	else if (!strcmp(token, "httpd_accel_no_pmtu_disc"))
++		parse_onoff(&Config.onoff.accel_no_pmtu_disc);
++#if DELAY_POOLS
++	else if (!strcmp(token, "delay_pools"))
++		parse_delay_pool_count(&Config.Delay);
++#endif
++#if DELAY_POOLS
++	else if (!strcmp(token, "delay_class"))
++		parse_delay_pool_class(&Config.Delay);
++#endif
++#if DELAY_POOLS
++	else if (!strcmp(token, "delay_access"))
++		parse_delay_pool_access(&Config.Delay);
++#endif
++#if DELAY_POOLS
++	else if (!strcmp(token, "delay_parameters"))
++		parse_delay_pool_rates(&Config.Delay);
++#endif
++#if DELAY_POOLS
++	else if (!strcmp(token, "delay_initial_bucket_level"))
++		parse_ushort(&Config.Delay.initial);
++#endif
++#if USE_WCCP
++	else if (!strcmp(token, "wccp_router"))
++		parse_address(&Config.Wccp.router);
++#endif
++#if USE_WCCPv2
++	else if (!strcmp(token, "wccp2_router"))
++		parse_sockaddr_in_list(&Config.Wccp2.router);
++#endif
++#if USE_WCCP
++	else if (!strcmp(token, "wccp_version"))
++		parse_int(&Config.Wccp.version);
++#endif
++#if USE_WCCPv2
++	else if (!strcmp(token, "wccp2_rebuild_wait"))
++		parse_onoff(&Config.Wccp2.rebuildwait);
++#endif
++#if USE_WCCPv2
++	else if (!strcmp(token, "wccp2_forwarding_method"))
++		parse_int(&Config.Wccp2.forwarding_method);
++#endif
++#if USE_WCCPv2
++	else if (!strcmp(token, "wccp2_return_method"))
++		parse_int(&Config.Wccp2.return_method);
++#endif
++#if USE_WCCPv2
++	else if (!strcmp(token, "wccp2_assignment_method"))
++		parse_int(&Config.Wccp2.assignment_method);
++#endif
++#if USE_WCCPv2
++	else if (!strcmp(token, "wccp2_service"))
++		parse_wccp2_service(&Config.Wccp2.info);
++#endif
++#if USE_WCCPv2
++	else if (!strcmp(token, "wccp2_service_info"))
++		parse_wccp2_service_info(&Config.Wccp2.info);
++#endif
++#if USE_WCCPv2
++	else if (!strcmp(token, "wccp2_weight"))
++		parse_int(&Config.Wccp2.weight);
++#endif
++#if USE_WCCP
++	else if (!strcmp(token, "wccp_address"))
++		parse_address(&Config.Wccp.address);
++#endif
++#if USE_WCCPv2
++	else if (!strcmp(token, "wccp2_address"))
++		parse_address(&Config.Wccp2.address);
++#endif
++	else if (!strcmp(token, "client_persistent_connections"))
++		parse_onoff(&Config.onoff.client_pconns);
++	else if (!strcmp(token, "server_persistent_connections"))
++		parse_onoff(&Config.onoff.server_pconns);
++	else if (!strcmp(token, "persistent_connection_after_error"))
++		parse_onoff(&Config.onoff.error_pconns);
++	else if (!strcmp(token, "detect_broken_pconn"))
++		parse_onoff(&Config.onoff.detect_broken_server_pconns);
++#if USE_CACHE_DIGESTS
++	else if (!strcmp(token, "digest_generation"))
++		parse_onoff(&Config.onoff.digest_generation);
++#endif
++#if USE_CACHE_DIGESTS
++	else if (!strcmp(token, "digest_bits_per_entry"))
++		parse_int(&Config.digest.bits_per_entry);
++#endif
++#if USE_CACHE_DIGESTS
++	else if (!strcmp(token, "digest_rebuild_period"))
++		parse_time_t(&Config.digest.rebuild_period);
++#endif
++#if USE_CACHE_DIGESTS
++	else if (!strcmp(token, "digest_rewrite_period"))
++		parse_time_t(&Config.digest.rewrite_period);
++#endif
++#if USE_CACHE_DIGESTS
++	else if (!strcmp(token, "digest_swapout_chunk_size"))
++		parse_b_size_t(&Config.digest.swapout_chunk_size);
++#endif
++#if USE_CACHE_DIGESTS
++	else if (!strcmp(token, "digest_rebuild_chunk_percentage"))
++		parse_int(&Config.digest.rebuild_chunk_percentage);
++#endif
++#if SQUID_SNMP
++	else if (!strcmp(token, "snmp_port"))
++		parse_ushort(&Config.Port.snmp);
++#endif
++#if SQUID_SNMP
++	else if (!strcmp(token, "snmp_access"))
++		parse_acl_access(&Config.accessList.snmp);
++#endif
++#if SQUID_SNMP
++	else if (!strcmp(token, "snmp_incoming_address"))
++		parse_address(&Config.Addrs.snmp_incoming);
++#endif
++#if SQUID_SNMP
++	else if (!strcmp(token, "snmp_outgoing_address"))
++		parse_address(&Config.Addrs.snmp_outgoing);
++#endif
++	else if (!strcmp(token, "icp_port"))
++		parse_ushort(&Config.Port.icp);
++	else if (!strcmp(token, "udp_port"))
++		parse_ushort(&Config.Port.icp);
++#if USE_HTCP
++	else if (!strcmp(token, "htcp_port"))
++		parse_ushort(&Config.Port.htcp);
++#endif
++	else if (!strcmp(token, "log_icp_queries"))
++		parse_onoff(&Config.onoff.log_udp);
++	else if (!strcmp(token, "udp_incoming_address"))
++		parse_address(&Config.Addrs.udp_incoming);
++	else if (!strcmp(token, "udp_outgoing_address"))
++		parse_address(&Config.Addrs.udp_outgoing);
++	else if (!strcmp(token, "icp_hit_stale"))
++		parse_onoff(&Config.onoff.icp_hit_stale);
++	else if (!strcmp(token, "minimum_direct_hops"))
++		parse_int(&Config.minDirectHops);
++	else if (!strcmp(token, "minimum_direct_rtt"))
++		parse_int(&Config.minDirectRtt);
++	else if (!strcmp(token, "netdb_low"))
++		parse_int(&Config.Netdb.low);
++	else if (!strcmp(token, "netdb_high"))
++		parse_int(&Config.Netdb.high);
++	else if (!strcmp(token, "netdb_ping_period"))
++		parse_time_t(&Config.Netdb.period);
++	else if (!strcmp(token, "query_icmp"))
++		parse_onoff(&Config.onoff.query_icmp);
++	else if (!strcmp(token, "test_reachability"))
++		parse_onoff(&Config.onoff.test_reachability);
++	else if (!strcmp(token, "icp_query_timeout"))
++		parse_int(&Config.Timeout.icp_query);
++	else if (!strcmp(token, "maximum_icp_query_timeout"))
++		parse_int(&Config.Timeout.icp_query_max);
++	else if (!strcmp(token, "minimum_icp_query_timeout"))
++		parse_int(&Config.Timeout.icp_query_min);
++	else if (!strcmp(token, "mcast_groups"))
++		parse_wordlist(&Config.mcast_group_list);
++#if MULTICAST_MISS_STREAM
++	else if (!strcmp(token, "mcast_miss_addr"))
++		parse_address(&Config.mcast_miss.addr);
++#endif
++#if MULTICAST_MISS_STREAM
++	else if (!strcmp(token, "mcast_miss_ttl"))
++		parse_ushort(&Config.mcast_miss.ttl);
++#endif
++#if MULTICAST_MISS_STREAM
++	else if (!strcmp(token, "mcast_miss_port"))
++		parse_ushort(&Config.mcast_miss.port);
++#endif
++#if MULTICAST_MISS_STREAM
++	else if (!strcmp(token, "mcast_miss_encode_key"))
++		parse_string(&Config.mcast_miss.encode_key);
++#endif
++	else if (!strcmp(token, "mcast_icp_query_timeout"))
++		parse_int(&Config.Timeout.mcast_icp_query);
++	else if (!strcmp(token, "icon_directory"))
++		parse_string(&Config.icons.directory);
++	else if (!strcmp(token, "global_internal_static"))
++		parse_onoff(&Config.onoff.global_internal_static);
++	else if (!strcmp(token, "short_icon_urls"))
++		parse_onoff(&Config.icons.use_short_names);
++	else if (!strcmp(token, "error_directory"))
++		parse_string(&Config.errorDirectory);
++	else if (!strcmp(token, "error_map"))
++		parse_errormap(&Config.errorMapList);
++	else if (!strcmp(token, "err_html_text"))
++		parse_eol(&Config.errHtmlText);
++	else if (!strcmp(token, "deny_info"))
++		parse_denyinfo(&Config.denyInfoList);
++	else if (!strcmp(token, "nonhierarchical_direct"))
++		parse_onoff(&Config.onoff.nonhierarchical_direct);
++	else if (!strcmp(token, "prefer_direct"))
++		parse_onoff(&Config.onoff.prefer_direct);
++#if HTTP_VIOLATIONS
++	else if (!strcmp(token, "ignore_ims_on_miss"))
++		parse_onoff(&Config.onoff.ignore_ims_on_miss);
++#endif
++	else if (!strcmp(token, "always_direct"))
++		parse_acl_access(&Config.accessList.AlwaysDirect);
++	else if (!strcmp(token, "never_direct"))
++		parse_acl_access(&Config.accessList.NeverDirect);
++	else if (!strcmp(token, "max_filedescriptors"))
++		parse_int(&Config.max_filedescriptors);
++	else if (!strcmp(token, "max_filedesc"))
++		parse_int(&Config.max_filedescriptors);
++	else if (!strcmp(token, "accept_filter"))
++		parse_string(&Config.accept_filter);
++	else if (!strcmp(token, "tcp_recv_bufsize"))
++		parse_b_size_t(&Config.tcpRcvBufsz);
++	else if (!strcmp(token, "incoming_rate"))
++		parse_int(&Config.incoming_rate);
++	else if (!strcmp(token, "check_hostnames"))
++		parse_onoff(&Config.onoff.check_hostnames);
++	else if (!strcmp(token, "allow_underscore"))
++		parse_onoff(&Config.onoff.allow_underscore);
++#if USE_DNSSERVERS
++	else if (!strcmp(token, "cache_dns_program"))
++		parse_string(&Config.Program.dnsserver);
++#endif
++#if USE_DNSSERVERS
++	else if (!strcmp(token, "dns_children"))
++		parse_int(&Config.dnsChildren);
++#endif
++#if !USE_DNSSERVERS
++	else if (!strcmp(token, "dns_retransmit_interval"))
++		parse_time_t(&Config.Timeout.idns_retransmit);
++#endif
++#if !USE_DNSSERVERS
++	else if (!strcmp(token, "dns_timeout"))
++		parse_time_t(&Config.Timeout.idns_query);
++#endif
++	else if (!strcmp(token, "dns_defnames"))
++		parse_onoff(&Config.onoff.res_defnames);
++	else if (!strcmp(token, "dns_nameservers"))
++		parse_wordlist(&Config.dns_nameservers);
++	else if (!strcmp(token, "hosts_file"))
++		parse_string(&Config.etcHostsPath);
++	else if (!strcmp(token, "dns_testnames"))
++		parse_wordlist(&Config.dns_testname_list);
++	else if (!strcmp(token, "append_domain"))
++		parse_string(&Config.appendDomain);
++	else if (!strcmp(token, "ignore_unknown_nameservers"))
++		parse_onoff(&Config.onoff.ignore_unknown_nameservers);
++	else if (!strcmp(token, "ipcache_size"))
++		parse_int(&Config.ipcache.size);
++	else if (!strcmp(token, "ipcache_low"))
++		parse_int(&Config.ipcache.low);
++	else if (!strcmp(token, "ipcache_high"))
++		parse_int(&Config.ipcache.high);
++	else if (!strcmp(token, "fqdncache_size"))
++		parse_int(&Config.fqdncache.size);
++	else if (!strcmp(token, "memory_pools"))
++		parse_onoff(&Config.onoff.mem_pools);
++	else if (!strcmp(token, "memory_pools_limit"))
++		parse_b_size_t(&Config.MemPools.limit);
++	else if (!strcmp(token, "forwarded_for"))
++		parse_onoff(&opt_forwarded_for);
++	else if (!strcmp(token, "cachemgr_passwd"))
++		parse_cachemgrpasswd(&Config.passwd_list);
++	else if (!strcmp(token, "client_db"))
++		parse_onoff(&Config.onoff.client_db);
++#if HTTP_VIOLATIONS
++	else if (!strcmp(token, "reload_into_ims"))
++		parse_onoff(&Config.onoff.reload_into_ims);
++#endif
++	else if (!strcmp(token, "maximum_single_addr_tries"))
++		parse_int(&Config.retry.maxtries);
++	else if (!strcmp(token, "retry_on_error"))
++		parse_onoff(&Config.retry.onerror);
++	else if (!strcmp(token, "as_whois_server"))
++		parse_string(&Config.as_whois_server);
++	else if (!strcmp(token, "offline_mode"))
++		parse_onoff(&Config.onoff.offline);
++	else if (!strcmp(token, "uri_whitespace"))
++		parse_uri_whitespace(&Config.uri_whitespace);
++	else if (!strcmp(token, "coredump_dir"))
++		parse_string(&Config.coredump_dir);
++	else if (!strcmp(token, "chroot"))
++		parse_string(&Config.chroot_dir);
++	else if (!strcmp(token, "balance_on_multiple_ip"))
++		parse_onoff(&Config.onoff.balance_on_multiple_ip);
++	else if (!strcmp(token, "pipeline_prefetch"))
++		parse_onoff(&Config.onoff.pipeline_prefetch);
++	else if (!strcmp(token, "high_response_time_warning"))
++		parse_int(&Config.warnings.high_rptm);
++	else if (!strcmp(token, "high_page_fault_warning"))
++		parse_int(&Config.warnings.high_pf);
++	else if (!strcmp(token, "high_memory_warning"))
++		parse_b_size_t(&Config.warnings.high_memory);
++	else if (!strcmp(token, "sleep_after_fork"))
++		parse_int(&Config.sleep_after_fork);
++	else if (!strcmp(token, "zero_buffers"))
++		parse_onoff(&Config.onoff.zero_buffers);
++	else if (!strcmp(token, "windows_ipaddrchangemonitor"))
++		parse_onoff(&Config.onoff.WIN32_IpAddrChangeMonitor);
++	else
++		result = 0; /* failure */
++	return(result);
++}
++
++static void
++dump_config(StoreEntry *entry)
++{
++	dump_authparam(entry, "auth_param", Config.authConfig);
++	dump_time_t(entry, "authenticate_cache_garbage_interval", Config.authenticateGCInterval);
++	dump_time_t(entry, "authenticate_ttl", Config.authenticateTTL);
++	dump_time_t(entry, "authenticate_ip_ttl", Config.authenticateIpTTL);
++	dump_time_t(entry, "authenticate_ip_shortcircuit_ttl", Config.authenticateIpShortcircuitTTL);
++	dump_externalAclHelper(entry, "external_acl_type", Config.externalAclHelperList);
++	dump_acl(entry, "acl", Config.aclList);
++	dump_acl_access(entry, "http_access", Config.accessList.http);
++	dump_acl_access(entry, "http_access2", Config.accessList.http2);
++	dump_acl_access(entry, "http_reply_access", Config.accessList.reply);
++	dump_acl_access(entry, "icp_access", Config.accessList.icp);
++#if USE_HTCP
++	dump_acl_access(entry, "htcp_access", Config.accessList.htcp);
++#endif
++#if USE_HTCP
++	dump_acl_access(entry, "htcp_clr_access", Config.accessList.htcp_clr);
++#endif
++	dump_acl_access(entry, "miss_access", Config.accessList.miss);
++#if USE_IDENT
++	dump_acl_access(entry, "ident_lookup_access", Config.accessList.identLookup);
++#endif
++	dump_body_size_t(entry, "reply_body_max_size", Config.ReplyBodySize);
++	dump_acl_access(entry, "authenticate_ip_shortcircuit_access", Config.accessList.auth_ip_shortcircuit);
++#if FOLLOW_X_FORWARDED_FOR
++	dump_acl_access(entry, "follow_x_forwarded_for", Config.accessList.followXFF);
++#endif
++#if FOLLOW_X_FORWARDED_FOR
++	dump_onoff(entry, "acl_uses_indirect_client", Config.onoff.acl_uses_indirect_client);
++#endif
++#if FOLLOW_X_FORWARDED_FOR
++	dump_onoff(entry, "delay_pool_uses_indirect_client", Config.onoff.delay_pool_uses_indirect_client);
++#endif
++#if FOLLOW_X_FORWARDED_FOR
++	dump_onoff(entry, "log_uses_indirect_client", Config.onoff.log_uses_indirect_client);
++#endif
++#if USE_SSL
++	dump_onoff(entry, "ssl_unclean_shutdown", Config.SSL.unclean_shutdown);
++#endif
++#if USE_SSL
++	dump_string(entry, "ssl_engine", Config.SSL.ssl_engine);
++#endif
++#if USE_SSL
++	dump_string(entry, "sslproxy_client_certificate", Config.ssl_client.cert);
++#endif
++#if USE_SSL
++	dump_string(entry, "sslproxy_client_key", Config.ssl_client.key);
++#endif
++#if USE_SSL
++	dump_int(entry, "sslproxy_version", Config.ssl_client.version);
++#endif
++#if USE_SSL
++	dump_string(entry, "sslproxy_options", Config.ssl_client.options);
++#endif
++#if USE_SSL
++	dump_string(entry, "sslproxy_cipher", Config.ssl_client.cipher);
++#endif
++#if USE_SSL
++	dump_string(entry, "sslproxy_cafile", Config.ssl_client.cafile);
++#endif
++#if USE_SSL
++	dump_string(entry, "sslproxy_capath", Config.ssl_client.capath);
++#endif
++#if USE_SSL
++	dump_string(entry, "sslproxy_flags", Config.ssl_client.flags);
++#endif
++#if USE_SSL
++	dump_string(entry, "sslpassword_program", Config.Program.ssl_password);
++#endif
++	dump_http_port_list(entry, "http_port", Config.Sockaddr.http);
++#if USE_SSL
++	dump_https_port_list(entry, "https_port", Config.Sockaddr.https);
++#endif
++	dump_acl_tos(entry, "tcp_outgoing_tos", Config.accessList.outgoing_tos);
++	dump_acl_address(entry, "tcp_outgoing_address", Config.accessList.outgoing_address);
++	dump_zph_mode(entry, "zph_mode", Config.zph_mode);
++	dump_int(entry, "zph_local", Config.zph_local);
++	dump_int(entry, "zph_sibling", Config.zph_sibling);
++	dump_int(entry, "zph_parent", Config.zph_parent);
++	dump_int(entry, "zph_option", Config.zph_option);
++	dump_peer(entry, "cache_peer", Config.peers);
++	dump_time_t(entry, "dead_peer_timeout", Config.Timeout.deadPeer);
++	dump_wordlist(entry, "hierarchy_stoplist", Config.hierarchy_stoplist);
++	dump_b_size_t(entry, "cache_mem", Config.memMaxSize);
++	dump_b_size_t(entry, "maximum_object_size_in_memory", Config.Store.maxInMemObjSize);
++	dump_removalpolicy(entry, "memory_replacement_policy", Config.memPolicy);
++	dump_removalpolicy(entry, "cache_replacement_policy", Config.replPolicy);
++	dump_cachedir(entry, "cache_dir", Config.cacheSwap);
++	dump_string(entry, "store_dir_select_algorithm", Config.store_dir_select_algorithm);
++	dump_int(entry, "max_open_disk_fds", Config.max_open_disk_fds);
++	dump_b_size_t(entry, "minimum_object_size", Config.Store.minObjectSize);
++	dump_b_size_t(entry, "maximum_object_size", Config.Store.maxObjectSize);
++	dump_int(entry, "cache_swap_low", Config.Swap.lowWaterMark);
++	dump_int(entry, "cache_swap_high", Config.Swap.highWaterMark);
++#if HTTP_VIOLATIONS
++	dump_onoff(entry, "update_headers", Config.onoff.update_headers);
++#endif
++	dump_logformat(entry, "logformat", Config.Log.logformats);
++	dump_access_log(entry, "access_log", Config.Log.accesslogs);
++	dump_acl_access(entry, "log_access", Config.accessList.log);
++	dump_string(entry, "logfile_daemon", Config.Program.logfile_daemon);
++	dump_string(entry, "cache_log", Config.Log.log);
++	dump_string(entry, "cache_store_log", Config.Log.store);
++	dump_string(entry, "cache_swap_state", Config.Log.swap);
++	dump_int(entry, "logfile_rotate", Config.Log.rotateNumber);
++	dump_onoff(entry, "emulate_httpd_log", Config.onoff.common_log);
++	dump_onoff(entry, "log_ip_on_direct", Config.onoff.log_ip_on_direct);
++	dump_string(entry, "mime_table", Config.mimeTablePathname);
++	dump_onoff(entry, "log_mime_hdrs", Config.onoff.log_mime_hdrs);
++#if USE_USERAGENT_LOG
++	dump_string(entry, "useragent_log", Config.Log.useragent);
++#endif
++#if USE_REFERER_LOG
++	dump_string(entry, "referer_log", Config.Log.referer);
++#endif
++	dump_string(entry, "pid_filename", Config.pidFilename);
++	dump_eol(entry, "debug_options", Config.debugOptions);
++	dump_onoff(entry, "log_fqdn", Config.onoff.log_fqdn);
++	dump_address(entry, "client_netmask", Config.Addrs.client_netmask);
++#if WIP_FWD_LOG
++	dump_string(entry, "forward_log", Config.Log.forward);
++#endif
++	dump_onoff(entry, "strip_query_terms", Config.onoff.strip_query_terms);
++	dump_onoff(entry, "buffered_logs", Config.onoff.buffered_logs);
++	dump_string(entry, "netdb_filename", Config.netdbFilename);
++	dump_string(entry, "ftp_user", Config.Ftp.anon_user);
++	dump_int(entry, "ftp_list_width", Config.Ftp.list_width);
++	dump_onoff(entry, "ftp_passive", Config.Ftp.passive);
++	dump_onoff(entry, "ftp_sanitycheck", Config.Ftp.sanitycheck);
++	dump_onoff(entry, "ftp_telnet_protocol", Config.Ftp.telnet);
++	dump_string(entry, "diskd_program", Config.Program.diskd);
++#if USE_UNLINKD
++	dump_string(entry, "unlinkd_program", Config.Program.unlinkd);
++#endif
++#if USE_ICMP
++	dump_string(entry, "pinger_program", Config.Program.pinger);
++#endif
++	dump_programline(entry, "storeurl_rewrite_program", Config.Program.store_rewrite.command);
++	dump_int(entry, "storeurl_rewrite_children", Config.Program.store_rewrite.children);
++	dump_int(entry, "storeurl_rewrite_concurrency", Config.Program.store_rewrite.concurrency);
++	dump_programline(entry, "url_rewrite_program", Config.Program.url_rewrite.command);
++	dump_int(entry, "url_rewrite_children", Config.Program.url_rewrite.children);
++	dump_int(entry, "url_rewrite_concurrency", Config.Program.url_rewrite.concurrency);
++	dump_onoff(entry, "url_rewrite_host_header", Config.onoff.redir_rewrites_host);
++	dump_acl_access(entry, "url_rewrite_access", Config.accessList.url_rewrite);
++	dump_acl_access(entry, "storeurl_access", Config.accessList.storeurl_rewrite);
++	dump_onoff(entry, "redirector_bypass", Config.onoff.redirector_bypass);
++	dump_programline(entry, "location_rewrite_program", Config.Program.location_rewrite.command);
++	dump_int(entry, "location_rewrite_children", Config.Program.location_rewrite.children);
++	dump_int(entry, "location_rewrite_concurrency", Config.Program.location_rewrite.concurrency);
++	dump_acl_access(entry, "location_rewrite_access", Config.accessList.location_rewrite);
++	dump_acl_access(entry, "cache", Config.accessList.noCache);
++	dump_time_t(entry, "max_stale", Config.maxStale);
++	dump_refreshpattern(entry, "refresh_pattern", Config.Refresh);
++	dump_kb_size_t(entry, "quick_abort_min", Config.quickAbort.min);
++	dump_kb_size_t(entry, "quick_abort_max", Config.quickAbort.max);
++	dump_int(entry, "quick_abort_pct", Config.quickAbort.pct);
++	dump_b_size_t(entry, "read_ahead_gap", Config.readAheadGap);
++	dump_time_t(entry, "negative_ttl", Config.negativeTtl);
++	dump_time_t(entry, "positive_dns_ttl", Config.positiveDnsTtl);
++	dump_time_t(entry, "negative_dns_ttl", Config.negativeDnsTtl);
++	dump_b_size_t(entry, "range_offset_limit", Config.rangeOffsetLimit);
++	dump_time_t(entry, "minimum_expiry_time", Config.minimum_expiry_time);
++	dump_kb_size_t(entry, "store_avg_object_size", Config.Store.avgObjectSize);
++	dump_int(entry, "store_objects_per_bucket", Config.Store.objectsPerBucket);
++	dump_b_size_t(entry, "request_header_max_size", Config.maxRequestHeaderSize);
++	dump_b_size_t(entry, "reply_header_max_size", Config.maxReplyHeaderSize);
++	dump_b_size_t(entry, "request_body_max_size", Config.maxRequestBodySize);
++	dump_acl_access(entry, "broken_posts", Config.accessList.brokenPosts);
++	dump_acl_access(entry, "upgrade_http0.9", Config.accessList.upgrade_http09);
++#if HTTP_VIOLATIONS
++	dump_onoff(entry, "via", Config.onoff.via);
++#endif
++	dump_onoff(entry, "cache_vary", Config.onoff.cache_vary);
++	dump_acl_access(entry, "broken_vary_encoding", Config.accessList.vary_encoding);
++	dump_onoff(entry, "collapsed_forwarding", Config.onoff.collapsed_forwarding);
++	dump_time_t(entry, "refresh_stale_hit", Config.refresh_stale_window);
++	dump_onoff(entry, "ie_refresh", Config.onoff.ie_refresh);
++	dump_onoff(entry, "vary_ignore_expire", Config.onoff.vary_ignore_expire);
++	dump_extension_method(entry, "extension_methods", RequestMethods);
++	dump_onoff(entry, "request_entities", Config.onoff.request_entities);
++#if HTTP_VIOLATIONS
++	dump_http_header_access(entry, "header_access", Config.header_access);
++#endif
++#if HTTP_VIOLATIONS
++	dump_http_header_replace(entry, "header_replace", Config.header_access);
++#endif
++	dump_tristate(entry, "relaxed_header_parser", Config.onoff.relaxed_header_parser);
++	dump_onoff(entry, "server_http11", Config.onoff.server_http11);
++	dump_onoff(entry, "ignore_expect_100", Config.onoff.ignore_expect_100);
++	dump_refreshCheckHelper(entry, "external_refresh_check", Config.Program.refresh_check);
++	dump_time_t(entry, "forward_timeout", Config.Timeout.forward);
++	dump_time_t(entry, "connect_timeout", Config.Timeout.connect);
++	dump_time_t(entry, "peer_connect_timeout", Config.Timeout.peer_connect);
++	dump_time_t(entry, "read_timeout", Config.Timeout.read);
++	dump_time_t(entry, "request_timeout", Config.Timeout.request);
++	dump_time_t(entry, "persistent_request_timeout", Config.Timeout.persistent_request);
++	dump_time_t(entry, "client_lifetime", Config.Timeout.lifetime);
++	dump_onoff(entry, "half_closed_clients", Config.onoff.half_closed_clients);
++	dump_time_t(entry, "pconn_timeout", Config.Timeout.pconn);
++#if USE_IDENT
++	dump_time_t(entry, "ident_timeout", Config.Timeout.ident);
++#endif
++	dump_time_t(entry, "shutdown_lifetime", Config.shutdownLifetime);
++	dump_string(entry, "cache_mgr", Config.adminEmail);
++	dump_string(entry, "mail_from", Config.EmailFrom);
++	dump_eol(entry, "mail_program", Config.EmailProgram);
++	dump_string(entry, "cache_effective_user", Config.effectiveUser);
++	dump_string(entry, "cache_effective_group", Config.effectiveGroup);
++	dump_onoff(entry, "httpd_suppress_version_string", Config.onoff.httpd_suppress_version_string);
++	dump_string(entry, "visible_hostname", Config.visibleHostname);
++	dump_string(entry, "unique_hostname", Config.uniqueHostname);
++	dump_wordlist(entry, "hostname_aliases", Config.hostnameAliases);
++	dump_int(entry, "umask", Config.umask);
++	dump_time_t(entry, "announce_period", Config.Announce.period);
++	dump_string(entry, "announce_host", Config.Announce.host);
++	dump_string(entry, "announce_file", Config.Announce.file);
++	dump_ushort(entry, "announce_port", Config.Announce.port);
++	dump_onoff(entry, "httpd_accel_no_pmtu_disc", Config.onoff.accel_no_pmtu_disc);
++#if DELAY_POOLS
++	dump_delay_pool_count(entry, "delay_pools", Config.Delay);
++#endif
++#if DELAY_POOLS
++	dump_delay_pool_class(entry, "delay_class", Config.Delay);
++#endif
++#if DELAY_POOLS
++	dump_delay_pool_access(entry, "delay_access", Config.Delay);
++#endif
++#if DELAY_POOLS
++	dump_delay_pool_rates(entry, "delay_parameters", Config.Delay);
++#endif
++#if DELAY_POOLS
++	dump_ushort(entry, "delay_initial_bucket_level", Config.Delay.initial);
++#endif
++#if USE_WCCP
++	dump_address(entry, "wccp_router", Config.Wccp.router);
++#endif
++#if USE_WCCPv2
++	dump_sockaddr_in_list(entry, "wccp2_router", Config.Wccp2.router);
++#endif
++#if USE_WCCP
++	dump_int(entry, "wccp_version", Config.Wccp.version);
++#endif
++#if USE_WCCPv2
++	dump_onoff(entry, "wccp2_rebuild_wait", Config.Wccp2.rebuildwait);
++#endif
++#if USE_WCCPv2
++	dump_int(entry, "wccp2_forwarding_method", Config.Wccp2.forwarding_method);
++#endif
++#if USE_WCCPv2
++	dump_int(entry, "wccp2_return_method", Config.Wccp2.return_method);
++#endif
++#if USE_WCCPv2
++	dump_int(entry, "wccp2_assignment_method", Config.Wccp2.assignment_method);
++#endif
++#if USE_WCCPv2
++	dump_wccp2_service(entry, "wccp2_service", Config.Wccp2.info);
++#endif
++#if USE_WCCPv2
++	dump_wccp2_service_info(entry, "wccp2_service_info", Config.Wccp2.info);
++#endif
++#if USE_WCCPv2
++	dump_int(entry, "wccp2_weight", Config.Wccp2.weight);
++#endif
++#if USE_WCCP
++	dump_address(entry, "wccp_address", Config.Wccp.address);
++#endif
++#if USE_WCCPv2
++	dump_address(entry, "wccp2_address", Config.Wccp2.address);
++#endif
++	dump_onoff(entry, "client_persistent_connections", Config.onoff.client_pconns);
++	dump_onoff(entry, "server_persistent_connections", Config.onoff.server_pconns);
++	dump_onoff(entry, "persistent_connection_after_error", Config.onoff.error_pconns);
++	dump_onoff(entry, "detect_broken_pconn", Config.onoff.detect_broken_server_pconns);
++#if USE_CACHE_DIGESTS
++	dump_onoff(entry, "digest_generation", Config.onoff.digest_generation);
++#endif
++#if USE_CACHE_DIGESTS
++	dump_int(entry, "digest_bits_per_entry", Config.digest.bits_per_entry);
++#endif
++#if USE_CACHE_DIGESTS
++	dump_time_t(entry, "digest_rebuild_period", Config.digest.rebuild_period);
++#endif
++#if USE_CACHE_DIGESTS
++	dump_time_t(entry, "digest_rewrite_period", Config.digest.rewrite_period);
++#endif
++#if USE_CACHE_DIGESTS
++	dump_b_size_t(entry, "digest_swapout_chunk_size", Config.digest.swapout_chunk_size);
++#endif
++#if USE_CACHE_DIGESTS
++	dump_int(entry, "digest_rebuild_chunk_percentage", Config.digest.rebuild_chunk_percentage);
++#endif
++#if SQUID_SNMP
++	dump_ushort(entry, "snmp_port", Config.Port.snmp);
++#endif
++#if SQUID_SNMP
++	dump_acl_access(entry, "snmp_access", Config.accessList.snmp);
++#endif
++#if SQUID_SNMP
++	dump_address(entry, "snmp_incoming_address", Config.Addrs.snmp_incoming);
++#endif
++#if SQUID_SNMP
++	dump_address(entry, "snmp_outgoing_address", Config.Addrs.snmp_outgoing);
++#endif
++	dump_ushort(entry, "icp_port", Config.Port.icp);
++#if USE_HTCP
++	dump_ushort(entry, "htcp_port", Config.Port.htcp);
++#endif
++	dump_onoff(entry, "log_icp_queries", Config.onoff.log_udp);
++	dump_address(entry, "udp_incoming_address", Config.Addrs.udp_incoming);
++	dump_address(entry, "udp_outgoing_address", Config.Addrs.udp_outgoing);
++	dump_onoff(entry, "icp_hit_stale", Config.onoff.icp_hit_stale);
++	dump_int(entry, "minimum_direct_hops", Config.minDirectHops);
++	dump_int(entry, "minimum_direct_rtt", Config.minDirectRtt);
++	dump_int(entry, "netdb_low", Config.Netdb.low);
++	dump_int(entry, "netdb_high", Config.Netdb.high);
++	dump_time_t(entry, "netdb_ping_period", Config.Netdb.period);
++	dump_onoff(entry, "query_icmp", Config.onoff.query_icmp);
++	dump_onoff(entry, "test_reachability", Config.onoff.test_reachability);
++	dump_int(entry, "icp_query_timeout", Config.Timeout.icp_query);
++	dump_int(entry, "maximum_icp_query_timeout", Config.Timeout.icp_query_max);
++	dump_int(entry, "minimum_icp_query_timeout", Config.Timeout.icp_query_min);
++	dump_wordlist(entry, "mcast_groups", Config.mcast_group_list);
++#if MULTICAST_MISS_STREAM
++	dump_address(entry, "mcast_miss_addr", Config.mcast_miss.addr);
++#endif
++#if MULTICAST_MISS_STREAM
++	dump_ushort(entry, "mcast_miss_ttl", Config.mcast_miss.ttl);
++#endif
++#if MULTICAST_MISS_STREAM
++	dump_ushort(entry, "mcast_miss_port", Config.mcast_miss.port);
++#endif
++#if MULTICAST_MISS_STREAM
++	dump_string(entry, "mcast_miss_encode_key", Config.mcast_miss.encode_key);
++#endif
++	dump_int(entry, "mcast_icp_query_timeout", Config.Timeout.mcast_icp_query);
++	dump_string(entry, "icon_directory", Config.icons.directory);
++	dump_onoff(entry, "global_internal_static", Config.onoff.global_internal_static);
++	dump_onoff(entry, "short_icon_urls", Config.icons.use_short_names);
++	dump_string(entry, "error_directory", Config.errorDirectory);
++	dump_errormap(entry, "error_map", Config.errorMapList);
++	dump_eol(entry, "err_html_text", Config.errHtmlText);
++	dump_denyinfo(entry, "deny_info", Config.denyInfoList);
++	dump_onoff(entry, "nonhierarchical_direct", Config.onoff.nonhierarchical_direct);
++	dump_onoff(entry, "prefer_direct", Config.onoff.prefer_direct);
++#if HTTP_VIOLATIONS
++	dump_onoff(entry, "ignore_ims_on_miss", Config.onoff.ignore_ims_on_miss);
++#endif
++	dump_acl_access(entry, "always_direct", Config.accessList.AlwaysDirect);
++	dump_acl_access(entry, "never_direct", Config.accessList.NeverDirect);
++	dump_int(entry, "max_filedescriptors", Config.max_filedescriptors);
++	dump_string(entry, "accept_filter", Config.accept_filter);
++	dump_b_size_t(entry, "tcp_recv_bufsize", Config.tcpRcvBufsz);
++	dump_int(entry, "incoming_rate", Config.incoming_rate);
++	dump_onoff(entry, "check_hostnames", Config.onoff.check_hostnames);
++	dump_onoff(entry, "allow_underscore", Config.onoff.allow_underscore);
++#if USE_DNSSERVERS
++	dump_string(entry, "cache_dns_program", Config.Program.dnsserver);
++#endif
++#if USE_DNSSERVERS
++	dump_int(entry, "dns_children", Config.dnsChildren);
++#endif
++#if !USE_DNSSERVERS
++	dump_time_t(entry, "dns_retransmit_interval", Config.Timeout.idns_retransmit);
++#endif
++#if !USE_DNSSERVERS
++	dump_time_t(entry, "dns_timeout", Config.Timeout.idns_query);
++#endif
++	dump_onoff(entry, "dns_defnames", Config.onoff.res_defnames);
++	dump_wordlist(entry, "dns_nameservers", Config.dns_nameservers);
++	dump_string(entry, "hosts_file", Config.etcHostsPath);
++	dump_wordlist(entry, "dns_testnames", Config.dns_testname_list);
++	dump_string(entry, "append_domain", Config.appendDomain);
++	dump_onoff(entry, "ignore_unknown_nameservers", Config.onoff.ignore_unknown_nameservers);
++	dump_int(entry, "ipcache_size", Config.ipcache.size);
++	dump_int(entry, "ipcache_low", Config.ipcache.low);
++	dump_int(entry, "ipcache_high", Config.ipcache.high);
++	dump_int(entry, "fqdncache_size", Config.fqdncache.size);
++	dump_onoff(entry, "memory_pools", Config.onoff.mem_pools);
++	dump_b_size_t(entry, "memory_pools_limit", Config.MemPools.limit);
++	dump_onoff(entry, "forwarded_for", opt_forwarded_for);
++	dump_cachemgrpasswd(entry, "cachemgr_passwd", Config.passwd_list);
++	dump_onoff(entry, "client_db", Config.onoff.client_db);
++#if HTTP_VIOLATIONS
++	dump_onoff(entry, "reload_into_ims", Config.onoff.reload_into_ims);
++#endif
++	dump_int(entry, "maximum_single_addr_tries", Config.retry.maxtries);
++	dump_onoff(entry, "retry_on_error", Config.retry.onerror);
++	dump_string(entry, "as_whois_server", Config.as_whois_server);
++	dump_onoff(entry, "offline_mode", Config.onoff.offline);
++	dump_uri_whitespace(entry, "uri_whitespace", Config.uri_whitespace);
++	dump_string(entry, "coredump_dir", Config.coredump_dir);
++	dump_string(entry, "chroot", Config.chroot_dir);
++	dump_onoff(entry, "balance_on_multiple_ip", Config.onoff.balance_on_multiple_ip);
++	dump_onoff(entry, "pipeline_prefetch", Config.onoff.pipeline_prefetch);
++	dump_int(entry, "high_response_time_warning", Config.warnings.high_rptm);
++	dump_int(entry, "high_page_fault_warning", Config.warnings.high_pf);
++	dump_b_size_t(entry, "high_memory_warning", Config.warnings.high_memory);
++	dump_int(entry, "sleep_after_fork", Config.sleep_after_fork);
++	dump_onoff(entry, "zero_buffers", Config.onoff.zero_buffers);
++	dump_onoff(entry, "windows_ipaddrchangemonitor", Config.onoff.WIN32_IpAddrChangeMonitor);
++}
++
++static void
++free_all(void)
++{
++	free_authparam(&Config.authConfig);
++	free_time_t(&Config.authenticateGCInterval);
++	free_time_t(&Config.authenticateTTL);
++	free_time_t(&Config.authenticateIpTTL);
++	free_time_t(&Config.authenticateIpShortcircuitTTL);
++	free_externalAclHelper(&Config.externalAclHelperList);
++	free_acl(&Config.aclList);
++	free_acl_access(&Config.accessList.http);
++	free_acl_access(&Config.accessList.http2);
++	free_acl_access(&Config.accessList.reply);
++	free_acl_access(&Config.accessList.icp);
++#if USE_HTCP
++	free_acl_access(&Config.accessList.htcp);
++#endif
++#if USE_HTCP
++	free_acl_access(&Config.accessList.htcp_clr);
++#endif
++	free_acl_access(&Config.accessList.miss);
++#if USE_IDENT
++	free_acl_access(&Config.accessList.identLookup);
++#endif
++	free_body_size_t(&Config.ReplyBodySize);
++	free_acl_access(&Config.accessList.auth_ip_shortcircuit);
++#if FOLLOW_X_FORWARDED_FOR
++	free_acl_access(&Config.accessList.followXFF);
++#endif
++#if FOLLOW_X_FORWARDED_FOR
++	free_onoff(&Config.onoff.acl_uses_indirect_client);
++#endif
++#if FOLLOW_X_FORWARDED_FOR
++	free_onoff(&Config.onoff.delay_pool_uses_indirect_client);
++#endif
++#if FOLLOW_X_FORWARDED_FOR
++	free_onoff(&Config.onoff.log_uses_indirect_client);
++#endif
++#if USE_SSL
++	free_onoff(&Config.SSL.unclean_shutdown);
++#endif
++#if USE_SSL
++	free_string(&Config.SSL.ssl_engine);
++#endif
++#if USE_SSL
++	free_string(&Config.ssl_client.cert);
++#endif
++#if USE_SSL
++	free_string(&Config.ssl_client.key);
++#endif
++#if USE_SSL
++	free_int(&Config.ssl_client.version);
++#endif
++#if USE_SSL
++	free_string(&Config.ssl_client.options);
++#endif
++#if USE_SSL
++	free_string(&Config.ssl_client.cipher);
++#endif
++#if USE_SSL
++	free_string(&Config.ssl_client.cafile);
++#endif
++#if USE_SSL
++	free_string(&Config.ssl_client.capath);
++#endif
++#if USE_SSL
++	free_string(&Config.ssl_client.flags);
++#endif
++#if USE_SSL
++	free_string(&Config.Program.ssl_password);
++#endif
++	free_http_port_list(&Config.Sockaddr.http);
++#if USE_SSL
++	free_https_port_list(&Config.Sockaddr.https);
++#endif
++	free_acl_tos(&Config.accessList.outgoing_tos);
++	free_acl_address(&Config.accessList.outgoing_address);
++	free_zph_mode(&Config.zph_mode);
++	free_int(&Config.zph_local);
++	free_int(&Config.zph_sibling);
++	free_int(&Config.zph_parent);
++	free_int(&Config.zph_option);
++	free_peer(&Config.peers);
++	free_time_t(&Config.Timeout.deadPeer);
++	free_wordlist(&Config.hierarchy_stoplist);
++	free_b_size_t(&Config.memMaxSize);
++	free_b_size_t(&Config.Store.maxInMemObjSize);
++	free_removalpolicy(&Config.memPolicy);
++	free_removalpolicy(&Config.replPolicy);
++	free_cachedir(&Config.cacheSwap);
++	free_string(&Config.store_dir_select_algorithm);
++	free_int(&Config.max_open_disk_fds);
++	free_b_size_t(&Config.Store.minObjectSize);
++	free_b_size_t(&Config.Store.maxObjectSize);
++	free_int(&Config.Swap.lowWaterMark);
++	free_int(&Config.Swap.highWaterMark);
++#if HTTP_VIOLATIONS
++	free_onoff(&Config.onoff.update_headers);
++#endif
++	free_logformat(&Config.Log.logformats);
++	free_access_log(&Config.Log.accesslogs);
++	free_acl_access(&Config.accessList.log);
++	free_string(&Config.Program.logfile_daemon);
++	free_string(&Config.Log.log);
++	free_string(&Config.Log.store);
++	free_string(&Config.Log.swap);
++	free_int(&Config.Log.rotateNumber);
++	free_onoff(&Config.onoff.common_log);
++	free_onoff(&Config.onoff.log_ip_on_direct);
++	free_string(&Config.mimeTablePathname);
++	free_onoff(&Config.onoff.log_mime_hdrs);
++#if USE_USERAGENT_LOG
++	free_string(&Config.Log.useragent);
++#endif
++#if USE_REFERER_LOG
++	free_string(&Config.Log.referer);
++#endif
++	free_string(&Config.pidFilename);
++	free_eol(&Config.debugOptions);
++	free_onoff(&Config.onoff.log_fqdn);
++	free_address(&Config.Addrs.client_netmask);
++#if WIP_FWD_LOG
++	free_string(&Config.Log.forward);
++#endif
++	free_onoff(&Config.onoff.strip_query_terms);
++	free_onoff(&Config.onoff.buffered_logs);
++	free_string(&Config.netdbFilename);
++	free_string(&Config.Ftp.anon_user);
++	free_int(&Config.Ftp.list_width);
++	free_onoff(&Config.Ftp.passive);
++	free_onoff(&Config.Ftp.sanitycheck);
++	free_onoff(&Config.Ftp.telnet);
++	free_string(&Config.Program.diskd);
++#if USE_UNLINKD
++	free_string(&Config.Program.unlinkd);
++#endif
++#if USE_ICMP
++	free_string(&Config.Program.pinger);
++#endif
++	free_programline(&Config.Program.store_rewrite.command);
++	free_int(&Config.Program.store_rewrite.children);
++	free_int(&Config.Program.store_rewrite.concurrency);
++	free_programline(&Config.Program.url_rewrite.command);
++	free_int(&Config.Program.url_rewrite.children);
++	free_int(&Config.Program.url_rewrite.concurrency);
++	free_onoff(&Config.onoff.redir_rewrites_host);
++	free_acl_access(&Config.accessList.url_rewrite);
++	free_acl_access(&Config.accessList.storeurl_rewrite);
++	free_onoff(&Config.onoff.redirector_bypass);
++	free_programline(&Config.Program.location_rewrite.command);
++	free_int(&Config.Program.location_rewrite.children);
++	free_int(&Config.Program.location_rewrite.concurrency);
++	free_acl_access(&Config.accessList.location_rewrite);
++	free_acl_access(&Config.accessList.noCache);
++	free_time_t(&Config.maxStale);
++	free_refreshpattern(&Config.Refresh);
++	free_kb_size_t(&Config.quickAbort.min);
++	free_kb_size_t(&Config.quickAbort.max);
++	free_int(&Config.quickAbort.pct);
++	free_b_size_t(&Config.readAheadGap);
++	free_time_t(&Config.negativeTtl);
++	free_time_t(&Config.positiveDnsTtl);
++	free_time_t(&Config.negativeDnsTtl);
++	free_b_size_t(&Config.rangeOffsetLimit);
++	free_time_t(&Config.minimum_expiry_time);
++	free_kb_size_t(&Config.Store.avgObjectSize);
++	free_int(&Config.Store.objectsPerBucket);
++	free_b_size_t(&Config.maxRequestHeaderSize);
++	free_b_size_t(&Config.maxReplyHeaderSize);
++	free_b_size_t(&Config.maxRequestBodySize);
++	free_acl_access(&Config.accessList.brokenPosts);
++	free_acl_access(&Config.accessList.upgrade_http09);
++#if HTTP_VIOLATIONS
++	free_onoff(&Config.onoff.via);
++#endif
++	free_onoff(&Config.onoff.cache_vary);
++	free_acl_access(&Config.accessList.vary_encoding);
++	free_onoff(&Config.onoff.collapsed_forwarding);
++	free_time_t(&Config.refresh_stale_window);
++	free_onoff(&Config.onoff.ie_refresh);
++	free_onoff(&Config.onoff.vary_ignore_expire);
++	free_extension_method(&RequestMethods);
++	free_onoff(&Config.onoff.request_entities);
++#if HTTP_VIOLATIONS
++	free_http_header_access(&Config.header_access[0]);
++#endif
++#if HTTP_VIOLATIONS
++	free_http_header_replace(&Config.header_access[0]);
++#endif
++	free_tristate(&Config.onoff.relaxed_header_parser);
++	free_onoff(&Config.onoff.server_http11);
++	free_onoff(&Config.onoff.ignore_expect_100);
++	free_refreshCheckHelper(&Config.Program.refresh_check);
++	free_time_t(&Config.Timeout.forward);
++	free_time_t(&Config.Timeout.connect);
++	free_time_t(&Config.Timeout.peer_connect);
++	free_time_t(&Config.Timeout.read);
++	free_time_t(&Config.Timeout.request);
++	free_time_t(&Config.Timeout.persistent_request);
++	free_time_t(&Config.Timeout.lifetime);
++	free_onoff(&Config.onoff.half_closed_clients);
++	free_time_t(&Config.Timeout.pconn);
++#if USE_IDENT
++	free_time_t(&Config.Timeout.ident);
++#endif
++	free_time_t(&Config.shutdownLifetime);
++	free_string(&Config.adminEmail);
++	free_string(&Config.EmailFrom);
++	free_eol(&Config.EmailProgram);
++	free_string(&Config.effectiveUser);
++	free_string(&Config.effectiveGroup);
++	free_onoff(&Config.onoff.httpd_suppress_version_string);
++	free_string(&Config.visibleHostname);
++	free_string(&Config.uniqueHostname);
++	free_wordlist(&Config.hostnameAliases);
++	free_int(&Config.umask);
++	free_time_t(&Config.Announce.period);
++	free_string(&Config.Announce.host);
++	free_string(&Config.Announce.file);
++	free_ushort(&Config.Announce.port);
++	free_onoff(&Config.onoff.accel_no_pmtu_disc);
++#if DELAY_POOLS
++	free_delay_pool_count(&Config.Delay);
++#endif
++#if DELAY_POOLS
++	free_delay_pool_class(&Config.Delay);
++#endif
++#if DELAY_POOLS
++	free_delay_pool_access(&Config.Delay);
++#endif
++#if DELAY_POOLS
++	free_delay_pool_rates(&Config.Delay);
++#endif
++#if DELAY_POOLS
++	free_ushort(&Config.Delay.initial);
++#endif
++#if USE_WCCP
++	free_address(&Config.Wccp.router);
++#endif
++#if USE_WCCPv2
++	free_sockaddr_in_list(&Config.Wccp2.router);
++#endif
++#if USE_WCCP
++	free_int(&Config.Wccp.version);
++#endif
++#if USE_WCCPv2
++	free_onoff(&Config.Wccp2.rebuildwait);
++#endif
++#if USE_WCCPv2
++	free_int(&Config.Wccp2.forwarding_method);
++#endif
++#if USE_WCCPv2
++	free_int(&Config.Wccp2.return_method);
++#endif
++#if USE_WCCPv2
++	free_int(&Config.Wccp2.assignment_method);
++#endif
++#if USE_WCCPv2
++	free_wccp2_service(&Config.Wccp2.info);
++#endif
++#if USE_WCCPv2
++	free_wccp2_service_info(&Config.Wccp2.info);
++#endif
++#if USE_WCCPv2
++	free_int(&Config.Wccp2.weight);
++#endif
++#if USE_WCCP
++	free_address(&Config.Wccp.address);
++#endif
++#if USE_WCCPv2
++	free_address(&Config.Wccp2.address);
++#endif
++	free_onoff(&Config.onoff.client_pconns);
++	free_onoff(&Config.onoff.server_pconns);
++	free_onoff(&Config.onoff.error_pconns);
++	free_onoff(&Config.onoff.detect_broken_server_pconns);
++#if USE_CACHE_DIGESTS
++	free_onoff(&Config.onoff.digest_generation);
++#endif
++#if USE_CACHE_DIGESTS
++	free_int(&Config.digest.bits_per_entry);
++#endif
++#if USE_CACHE_DIGESTS
++	free_time_t(&Config.digest.rebuild_period);
++#endif
++#if USE_CACHE_DIGESTS
++	free_time_t(&Config.digest.rewrite_period);
++#endif
++#if USE_CACHE_DIGESTS
++	free_b_size_t(&Config.digest.swapout_chunk_size);
++#endif
++#if USE_CACHE_DIGESTS
++	free_int(&Config.digest.rebuild_chunk_percentage);
++#endif
++#if SQUID_SNMP
++	free_ushort(&Config.Port.snmp);
++#endif
++#if SQUID_SNMP
++	free_acl_access(&Config.accessList.snmp);
++#endif
++#if SQUID_SNMP
++	free_address(&Config.Addrs.snmp_incoming);
++#endif
++#if SQUID_SNMP
++	free_address(&Config.Addrs.snmp_outgoing);
++#endif
++	free_ushort(&Config.Port.icp);
++#if USE_HTCP
++	free_ushort(&Config.Port.htcp);
++#endif
++	free_onoff(&Config.onoff.log_udp);
++	free_address(&Config.Addrs.udp_incoming);
++	free_address(&Config.Addrs.udp_outgoing);
++	free_onoff(&Config.onoff.icp_hit_stale);
++	free_int(&Config.minDirectHops);
++	free_int(&Config.minDirectRtt);
++	free_int(&Config.Netdb.low);
++	free_int(&Config.Netdb.high);
++	free_time_t(&Config.Netdb.period);
++	free_onoff(&Config.onoff.query_icmp);
++	free_onoff(&Config.onoff.test_reachability);
++	free_int(&Config.Timeout.icp_query);
++	free_int(&Config.Timeout.icp_query_max);
++	free_int(&Config.Timeout.icp_query_min);
++	free_wordlist(&Config.mcast_group_list);
++#if MULTICAST_MISS_STREAM
++	free_address(&Config.mcast_miss.addr);
++#endif
++#if MULTICAST_MISS_STREAM
++	free_ushort(&Config.mcast_miss.ttl);
++#endif
++#if MULTICAST_MISS_STREAM
++	free_ushort(&Config.mcast_miss.port);
++#endif
++#if MULTICAST_MISS_STREAM
++	free_string(&Config.mcast_miss.encode_key);
++#endif
++	free_int(&Config.Timeout.mcast_icp_query);
++	free_string(&Config.icons.directory);
++	free_onoff(&Config.onoff.global_internal_static);
++	free_onoff(&Config.icons.use_short_names);
++	free_string(&Config.errorDirectory);
++	free_errormap(&Config.errorMapList);
++	free_eol(&Config.errHtmlText);
++	free_denyinfo(&Config.denyInfoList);
++	free_onoff(&Config.onoff.nonhierarchical_direct);
++	free_onoff(&Config.onoff.prefer_direct);
++#if HTTP_VIOLATIONS
++	free_onoff(&Config.onoff.ignore_ims_on_miss);
++#endif
++	free_acl_access(&Config.accessList.AlwaysDirect);
++	free_acl_access(&Config.accessList.NeverDirect);
++	free_int(&Config.max_filedescriptors);
++	free_string(&Config.accept_filter);
++	free_b_size_t(&Config.tcpRcvBufsz);
++	free_int(&Config.incoming_rate);
++	free_onoff(&Config.onoff.check_hostnames);
++	free_onoff(&Config.onoff.allow_underscore);
++#if USE_DNSSERVERS
++	free_string(&Config.Program.dnsserver);
++#endif
++#if USE_DNSSERVERS
++	free_int(&Config.dnsChildren);
++#endif
++#if !USE_DNSSERVERS
++	free_time_t(&Config.Timeout.idns_retransmit);
++#endif
++#if !USE_DNSSERVERS
++	free_time_t(&Config.Timeout.idns_query);
++#endif
++	free_onoff(&Config.onoff.res_defnames);
++	free_wordlist(&Config.dns_nameservers);
++	free_string(&Config.etcHostsPath);
++	free_wordlist(&Config.dns_testname_list);
++	free_string(&Config.appendDomain);
++	free_onoff(&Config.onoff.ignore_unknown_nameservers);
++	free_int(&Config.ipcache.size);
++	free_int(&Config.ipcache.low);
++	free_int(&Config.ipcache.high);
++	free_int(&Config.fqdncache.size);
++	free_onoff(&Config.onoff.mem_pools);
++	free_b_size_t(&Config.MemPools.limit);
++	free_onoff(&opt_forwarded_for);
++	free_cachemgrpasswd(&Config.passwd_list);
++	free_onoff(&Config.onoff.client_db);
++#if HTTP_VIOLATIONS
++	free_onoff(&Config.onoff.reload_into_ims);
++#endif
++	free_int(&Config.retry.maxtries);
++	free_onoff(&Config.retry.onerror);
++	free_string(&Config.as_whois_server);
++	free_onoff(&Config.onoff.offline);
++	free_uri_whitespace(&Config.uri_whitespace);
++	free_string(&Config.coredump_dir);
++	free_string(&Config.chroot_dir);
++	free_onoff(&Config.onoff.balance_on_multiple_ip);
++	free_onoff(&Config.onoff.pipeline_prefetch);
++	free_int(&Config.warnings.high_rptm);
++	free_int(&Config.warnings.high_pf);
++	free_b_size_t(&Config.warnings.high_memory);
++	free_int(&Config.sleep_after_fork);
++	free_onoff(&Config.onoff.zero_buffers);
++	free_onoff(&Config.onoff.WIN32_IpAddrChangeMonitor);
++}
++
+diff -Naur squid-2.7.STABLE9-ori/src/globals.c squid-2.7.STABLE9-new/src/globals.c
+--- squid-2.7.STABLE9-ori/src/globals.c	1970-01-01 08:00:00.000000000 +0800
++++ squid-2.7.STABLE9-new/src/globals.c	2014-06-18 02:04:11.792233244 +0800
+@@ -0,0 +1,165 @@
++#include "squid.h"
++/*
++ * $Id: globals.h,v 1.126 2007/09/24 13:28:48 hno Exp $
++ *
++ *
++ * SQUID Web Proxy Cache          http://www.squid-cache.org/
++ * ----------------------------------------------------------
++ *
++ *  Squid is the result of efforts by numerous individuals from
++ *  the Internet community; see the CONTRIBUTORS file for full
++ *  details.   Many organizations have provided support for Squid's
++ *  development; see the SPONSORS file for full details.  Squid is
++ *  Copyrighted (C) 2001 by the Regents of the University of
++ *  California; see the COPYRIGHT file for full details.  Squid
++ *  incorporates software developed and/or copyrighted by other
++ *  sources; see the CREDITS file for full details.
++ *
++ *  This program is free software; you can redistribute it and/or modify
++ *  it under the terms of the GNU General Public License as published by
++ *  the Free Software Foundation; either version 2 of the License, or
++ *  (at your option) any later version.
++ *  
++ *  This program is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ *  GNU General Public License for more details.
++ *  
++ *  You should have received a copy of the GNU General Public License
++ *  along with this program; if not, write to the Free Software
++ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111, USA.
++ *
++ */
++FILE *debug_log = NULL;
++SquidConfig Config;
++SquidConfig2 Config2;
++char *ConfigFile = NULL;
++const char *dns_error_message = NULL;
++char tmp_error_buf[ERROR_BUF_SZ];
++char *volatile debug_options = NULL;
++char ThisCache[SQUIDHOSTNAMELEN << 1];
++char ThisCache2[SQUIDHOSTNAMELEN << 1];
++char config_input_line[BUFSIZ];
++const char *AclMatchedName = NULL;
++const char *DefaultConfigFile = DEFAULT_CONFIG_FILE;
++const char *cfg_filename = NULL;
++const char *const appname = "squid";
++const char *const dash_str = "-";
++const char *const localhost = "127.0.0.1";
++const char *const null_string = "";
++const char *const version_string = VERSION;
++const char *const full_appname_string = PACKAGE "/" VERSION;
++const char *const appname_string = PACKAGE;
++char *visible_appname_string;
++const char *const w_space = " \t\n\r";
++fde *fd_table = NULL;
++int Biggest_FD = -1;
++int Number_FD = 0;
++int Opening_FD = 0;
++int HttpSockets[MAXHTTPPORTS];
++int NDnsServersAlloc = 0;
++int NHttpSockets = 0;
++int RESERVED_FD;
++int Squid_MaxFD = SQUID_MAXFD;
++int config_lineno = 0;
++int debugLevels[MAX_DEBUG_SECTIONS];
++int do_mallinfo = 0;
++int opt_reuseaddr = 1;
++int icmp_sock = -1;
++int neighbors_do_private_keys = 1;
++int opt_catch_signals = 1;
++int opt_debug_stderr = -1;
++int opt_dns_tests = 1;
++int opt_foreground_rebuild = 0;
++int opt_forwarded_for = 1;
++int opt_reload_hit_only = 0;
++int opt_stdin_overrides_http_port = 0;
++#if HAVE_SYSLOG
++int opt_syslog_enable = 0;
++#endif
++int opt_udp_hit_obj = 0;
++int opt_create_swap_dirs = 0;
++int opt_store_doublecheck = 0;
++int syslog_enable = 0;
++int theInIcpConnection = -1;
++int theOutIcpConnection = -1;
++int DnsSocket = -1;
++#ifdef SQUID_SNMP
++int theInSnmpConnection = -1;
++int theOutSnmpConnection = -1;
++char *snmp_agentinfo;
++#endif
++int n_disk_objects = 0;
++iostats IOStats;
++struct _acl_deny_info_list *DenyInfoList = NULL;
++struct in_addr any_addr;
++struct in_addr local_addr;
++struct in_addr no_addr;
++struct in_addr theOutICPAddr;
++struct in_addr theOutSNMPAddr;
++struct timeval current_time;
++struct timeval squid_start;
++time_t squid_curtime = 0;
++int shutting_down = 0;
++int reconfiguring = 0;
++int store_dirs_rebuilding = 1;
++int store_swap_size = 0;
++unsigned long store_mem_size = 0;
++time_t hit_only_mode_until = 0;
++StatCounters statCounter;
++double request_failure_ratio = 0.0;
++double current_dtime;
++int store_hash_buckets = 0;
++hash_table *store_table = NULL;
++dlink_list ClientActiveRequests;
++const String StringNull = { 0, 0, NULL };
++const MemBuf MemBufNull = MemBufNULL;
++int hot_obj_count = 0;
++int _db_level;
++const int CacheDigestHashFuncCount = 4;
++CacheDigest *store_digest = NULL;
++const char *StoreDigestFileName = "store_digest";
++const char *StoreDigestMimeStr = "application/cache-digest";
++#if USE_CACHE_DIGESTS
++const Version CacheDigestVer = { 5, 3 };
++#endif
++const char *MultipartMsgBoundaryStr = "Unique-Squid-Separator";
++icpUdpData *IcpQueueHead = NULL;
++#if HTTP_VIOLATIONS
++int refresh_nocache_hack = 0;
++#endif
++request_flags null_request_flags;
++int store_open_disk_fd = 0;
++authscheme_entry_t *authscheme_list = NULL;
++storefs_entry_t *storefs_list = NULL;
++storerepl_entry_t *storerepl_list = NULL;
++int store_swap_low = 0;
++int store_swap_high = 0;
++int store_pages_max = 0;
++squid_off_t store_maxobjsize = -1;
++RemovalPolicy *mem_policy;
++hash_table *proxy_auth_username_cache = NULL;
++int incoming_sockets_accepted;
++#ifdef _SQUID_WIN32_
++unsigned int WIN32_Socks_initialized = 0;
++unsigned int WIN32_OS_version = 0;
++char *WIN32_OS_string = NULL;
++char *WIN32_Service_name = NULL;
++char *WIN32_Command_Line = NULL;
++char *WIN32_Service_Command_Line = NULL;
++unsigned int WIN32_run_mode = _WIN_SQUID_RUN_MODE_INTERACTIVE;
++#endif
++const char *external_acl_message = NULL;
++#if HAVE_SBRK
++void *sbrk_start = 0;
++#endif
++int opt_send_signal = -1;
++int opt_no_daemon = 0;
++#if LINUX_TPROXY
++int need_linux_tproxy = 0;
++#endif
++int opt_parse_cfg_only = 0;
++int n_coss_dirs = 0;
++#ifdef LOG_LOCAL4
++int syslog_facility = LOG_LOCAL4;
++#endif
+diff -Naur squid-2.7.STABLE9-ori/src/main.c squid-2.7.STABLE9-new/src/main.c
+--- squid-2.7.STABLE9-ori/src/main.c	2010-03-07 23:58:56.000000000 +0800
++++ squid-2.7.STABLE9-new/src/main.c	2014-06-18 02:04:11.800233246 +0800
+@@ -35,6 +35,9 @@
+ 
+ #include "squid.h"
+ 
++#define KEYWORDS "/etc/squid/keyword.txt"
++#define EXCLUSIONS "/etc/squid/exclusions.txt"
++
+ #if defined(USE_WIN32_SERVICE) && defined(_SQUID_WIN32_)
+ #include <windows.h>
+ #include <process.h>
+@@ -687,6 +690,10 @@
+     int WIN32_init_err;
+ #endif
+ 
++  printf("AC initialization\n");
++	init_acsm(0,KEYWORDS);
++	init_acsm(1,EXCLUSIONS);
++    
+ #if HAVE_SBRK
+     sbrk_start = sbrk(0);
+ #endif
+diff -Naur squid-2.7.STABLE9-ori/src/Makefile.in squid-2.7.STABLE9-new/src/Makefile.in
+--- squid-2.7.STABLE9-ori/src/Makefile.in	2010-03-15 04:27:27.000000000 +0800
++++ squid-2.7.STABLE9-new/src/Makefile.in	2014-06-18 02:46:51.144283184 +0800
+@@ -110,7 +110,7 @@
+ 	store_rebuild.c store_swapin.c store_swapmeta.c \
+ 	store_swapout.c store_update.c structs.h tools.c typedefs.h \
+ 	unlinkd.c url.c urn.c useragent.c wccp.c wccp2.c whois.c \
+-	win32.c
++	win32.c acsmDFA.c 
+ @USE_DEVPOLL_FALSE@@USE_EPOLL_FALSE@@USE_KQUEUE_FALSE@@USE_POLL_FALSE@@USE_SELECT_FALSE@@USE_SELECT_SIMPLE_FALSE@@USE_SELECT_WIN32_TRUE@am__objects_1 = comm_select_win32.$(OBJEXT)
+ @USE_DEVPOLL_FALSE@@USE_EPOLL_FALSE@@USE_KQUEUE_FALSE@@USE_POLL_FALSE@@USE_SELECT_SIMPLE_FALSE@@USE_SELECT_TRUE@am__objects_1 = comm_select.$(OBJEXT)
+ @USE_DEVPOLL_FALSE@@USE_EPOLL_FALSE@@USE_KQUEUE_FALSE@@USE_POLL_FALSE@@USE_SELECT_SIMPLE_TRUE@am__objects_1 = comm_select_simple.$(OBJEXT)
+@@ -132,6 +132,7 @@
+ @ENABLE_UNLINKD_TRUE@am__objects_9 = unlinkd.$(OBJEXT)
+ @ENABLE_WIN32SPECIFIC_TRUE@am__objects_10 = win32.$(OBJEXT)
+ am_squid_OBJECTS = access_log.$(OBJEXT) acl.$(OBJEXT) asn.$(OBJEXT) \
++	acsmDFA.$(OBJEXT) \
+ 	authenticate.$(OBJEXT) cache_cf.$(OBJEXT) \
+ 	CacheDigest.$(OBJEXT) cache_manager.$(OBJEXT) carp.$(OBJEXT) \
+ 	cbdata.$(OBJEXT) client_db.$(OBJEXT) client_side.$(OBJEXT) \
+@@ -260,7 +261,7 @@
+ LIBDLMALLOC = @LIBDLMALLOC@
+ LIBOBJS = @LIBOBJS@
+ LIBREGEX = @LIBREGEX@
+-LIBS = @LIBS@
++LIBS = @LIBS@ -lvideoreg
+ LIBSASL = @LIBSASL@
+ LIB_DB = @LIB_DB@
+ LIB_EPOLL = @LIB_EPOLL@
+@@ -422,6 +423,8 @@
+ 	win32.c
+ 
+ squid_SOURCES = \
++	acsmDFA.h \
++	acsmDFA.c \
+ 	access_log.c \
+ 	acl.c \
+ 	asn.c \
+diff -Naur squid-2.7.STABLE9-ori/src/repl_modules.c squid-2.7.STABLE9-new/src/repl_modules.c
+--- squid-2.7.STABLE9-ori/src/repl_modules.c	1970-01-01 08:00:00.000000000 +0800
++++ squid-2.7.STABLE9-new/src/repl_modules.c	2014-06-18 02:04:11.804233244 +0800
+@@ -0,0 +1,10 @@
++/* automatically generated by ./repl_modules.sh lru
++ * do not edit
++ */
++#include "squid.h"
++
++extern REMOVALPOLICYCREATE createRemovalPolicy_lru;
++void storeReplSetup(void)
++{
++	storeReplAdd("lru", createRemovalPolicy_lru);
++}
+diff -Naur squid-2.7.STABLE9-ori/src/squid.h squid-2.7.STABLE9-new/src/squid.h
+--- squid-2.7.STABLE9-ori/src/squid.h	2010-02-13 04:22:18.000000000 +0800
++++ squid-2.7.STABLE9-new/src/squid.h	2014-06-18 03:00:31.456299864 +0800
+@@ -396,6 +396,10 @@
+ #include "structs.h"
+ #include "protos.h"
+ #include "globals.h"
++/*use for video cache*/
++#include "acsmDFA.h"
++#include <videoreg.h>
++#define MAX_LEN	2048
+ 
+ #include "util.h"
+ 
+@@ -522,4 +526,5 @@
+ #define RUNNING_ON_VALGRIND 0
+ #endif /* WITH_VALGRIND */
+ 
++
+ #endif /* SQUID_H */
+diff -Naur squid-2.7.STABLE9-ori/src/store.c squid-2.7.STABLE9-new/src/store.c
+--- squid-2.7.STABLE9-ori/src/store.c	2010-02-14 08:45:52.000000000 +0800
++++ squid-2.7.STABLE9-new/src/store.c	2014-06-18 02:04:11.804233244 +0800
+@@ -348,7 +348,8 @@
+ StoreEntry *
+ storeGet(const cache_key * key)
+ {
+-    debug(20, 3) ("storeGet: looking up %s\n", storeKeyText(key));
++    //debug(20, 3) ("storeGet: looking up %s\n", storeKeyText(key));
++     debug(20, 9) ("storeGet: looking up %s\n", storeKeyText(key));
+     return (StoreEntry *) hash_lookup(store_table, key);
+ }
+ 
+@@ -1093,7 +1094,18 @@
+     e->lock_count = 1;		/* Note lock here w/o calling storeLock() */
+     mem = e->mem_obj;
+     mem->method = method;
+-    if (neighbors_do_private_keys || !flags.hierarchical)
++    /*Add for youku video cache*/
++    char query_str[MAX_LEN];
++    int ret = -1;
++		memset(query_str, 0, sizeof(query_str));
++		ConvertCaseEX((unsigned char *)query_str, (unsigned char *)url, strlen(url));
++    ret = acsmSearch_cap(acsm_cap[0], (unsigned char *)query_str, strlen(query_str));
++		
++		if ( (ret-100) >=0) {
++			storeSetPublicKey(e);
++	  	debug(20, 8) ("in order to video cache,we need set to public key: '%s'\n", url);
++		}		 
++    else if (neighbors_do_private_keys || !flags.hierarchical)
+ 	storeSetPrivateKey(e);
+     else
+ 	storeSetPublicKey(e);
+diff -Naur squid-2.7.STABLE9-ori/src/store_client.c squid-2.7.STABLE9-new/src/store_client.c
+--- squid-2.7.STABLE9-ori/src/store_client.c	2009-09-17 04:55:26.000000000 +0800
++++ squid-2.7.STABLE9-new/src/store_client.c	2014-06-18 02:04:11.804233244 +0800
+@@ -473,12 +473,14 @@
+ 	    }
+ 	}
+ 	/* If we have no store URL then the request and the memory URL must match */
++	/*
+ 	if ((!new_store_url) && mem->url && strcasecmp(mem->url, new_url) != 0) {
+ 	    debug(20, 1) ("storeClientReadHeader: URL mismatch\n");
+ 	    debug(20, 1) ("\t{%s} != {%s}\n", (char *) new_url, mem->url);
+ 	    swap_object_ok = 0;
+ 	    break;
+ 	}
++	*/
+     } while (0);
+ 
+     storeSwapTLVFree(tlv_list);
+diff -Naur squid-2.7.STABLE9-ori/src/store_key_md5.c squid-2.7.STABLE9-new/src/store_key_md5.c
+--- squid-2.7.STABLE9-ori/src/store_key_md5.c	2008-01-02 23:49:31.000000000 +0800
++++ squid-2.7.STABLE9-new/src/store_key_md5.c	2014-06-18 03:00:11.800299627 +0800
+@@ -35,8 +35,10 @@
+ 
+ #include "squid.h"
+ 
++
+ static cache_key null_key[SQUID_MD5_DIGEST_LENGTH];
+ 
++
+ const char *
+ storeKeyText(const unsigned char *key)
+ {
+@@ -97,13 +99,13 @@
+     static cache_key digest[SQUID_MD5_DIGEST_LENGTH];
+     SQUID_MD5_CTX M;
+     assert(id > 0);
+-    debug(20, 3) ("storeKeyPrivate: %s %s\n",
+-	RequestMethods[method].str, url);
++     debug(20, 1) ("storeKeyPrivate: %s %s %d\n",RequestMethods[method].str, url,id);
+     SQUID_MD5Init(&M);
+     SQUID_MD5Update(&M, (unsigned char *) &id, sizeof(id));
+     SQUID_MD5Update(&M, (unsigned char *) &method, sizeof(method));
+     SQUID_MD5Update(&M, (unsigned char *) url, strlen(url));
+     SQUID_MD5Final(digest, &M);
++     debug(20, 1) ("private digest: %s\n",storeKeyText(digest));
+     return digest;
+ }
+ 
+@@ -112,11 +114,33 @@
+ {
+     static cache_key digest[SQUID_MD5_DIGEST_LENGTH];
+     unsigned char m = (unsigned char) method;
++     debug(20, 1) ("storeKeyPublic: %s %s\n",RequestMethods[method].str, url);
++    char videoID[MAX_LEN];
++    char query_str[MAX_LEN];
++    int ret = -1;
++		memset(query_str, 0, sizeof(query_str));
++		memset(videoID, 0, sizeof(videoID));
++		ConvertCaseEX( (unsigned char *)query_str, (unsigned char *)url, strlen((const char *)url) );
++		ret = acsmSearch_cap(acsm_cap[1], (unsigned char *)query_str, strlen(query_str));
++		if ( ret>0 && ret<100) {
++			debug(20, 1)("The url: %s is in the AC exclusions list!\n", url);
++		}
++		else{
++			ret = acsmSearch_cap(acsm_cap[0], (unsigned char *)query_str, strlen(query_str));
++			if ( (ret-100) >=0) {
++				debug(20, 1)("The url: %s is in the AC keywords list!\n",url);
++				if(selectFunc(url,videoID,ret)){
++					url=videoID;
++				 	debug(20, 1)("video_cache_url:%s\n",url);
++		  	}
++			}
++		}	
+     SQUID_MD5_CTX M;
+     SQUID_MD5Init(&M);
+     SQUID_MD5Update(&M, &m, sizeof(m));
+     SQUID_MD5Update(&M, (unsigned char *) url, strlen(url));
+     SQUID_MD5Final(digest, &M);
++    debug(20, 1) ("video digest: %s\n",storeKeyText(digest));
+     return digest;
+ }
+ 
+@@ -133,32 +157,56 @@
+     unsigned char m = (unsigned char) method;
+     const char *url;
+     SQUID_MD5_CTX M;
+-
+     if (request->store_url) {
+-	url = request->store_url;
++	  url = request->store_url;
+     } else {
+-	url = urlCanonical(request);
+-    }
+-
++	  url = urlCanonical(request);
++		 debug(20, 1) ("Canonical_url:%s\n", url);
++	  }
++	  
++		char videoID[MAX_LEN];
++    char query_str[MAX_LEN];
++    int ret = -1;
++		memset(query_str, 0, sizeof(query_str));
++		memset(videoID, 0, sizeof(videoID));
++		if(strlen(url)<=MAX_LEN){
++			ConvertCaseEX((unsigned char *)query_str, (unsigned char *)url, strlen(url));
++			ret = acsmSearch_cap(acsm_cap[1], (unsigned char *)query_str, strlen(query_str));
++		}
++		if ( ret>0 && ret<100) {
++			printf("The url: %s is in the AC exclusions list!\n", url);
++		}
++		else{
++			ret = acsmSearch_cap(acsm_cap[0], (unsigned char *)query_str, strlen(query_str));
++			if ( (ret-100) >=0) {
++				debug(20, 1)("The url: %s is in the AC keywords list!\n",url);
++				if(selectFunc(url,videoID,ret)){
++					url=videoID;
++				 	debug(20, 1)("video_cache_url:%s\n",url);
++		  	}
++			}
++		}		 
+     SQUID_MD5Init(&M);
+     SQUID_MD5Update(&M, &m, sizeof(m));
+     SQUID_MD5Update(&M, (unsigned char *) url, strlen(url));
+     if (request->vary_headers) {
+-	SQUID_MD5Update(&M, (unsigned char *) "\0V", 2);
+-	SQUID_MD5Update(&M, (unsigned char *) request->vary_headers, strlen(request->vary_headers));
+-	if (strBuf(request->vary_encoding)) {
++		SQUID_MD5Update(&M, (unsigned char *) "\0V", 2);
++		SQUID_MD5Update(&M, (unsigned char *) request->vary_headers, strlen(request->vary_headers));
++		if (strBuf(request->vary_encoding)) {
+ 	    SQUID_MD5Update(&M, (unsigned char *) "\0E", 2);
+ 	    SQUID_MD5Update(&M, (unsigned char *) strBuf(request->vary_encoding), strLen(request->vary_encoding));
+-	}
++		}
+     }
+     if (request->urlgroup) {
+-	SQUID_MD5Update(&M, (unsigned char *) "\0G", 2);
+-	SQUID_MD5Update(&M, (unsigned char *) request->urlgroup, strlen(request->urlgroup));
++		SQUID_MD5Update(&M, (unsigned char *) "\0G", 2);
++		SQUID_MD5Update(&M, (unsigned char *) request->urlgroup, strlen(request->urlgroup));
+     }
+     SQUID_MD5Final(digest, &M);
++     debug(20, 1) ("youku match storeKeyPublicByRequestMethod digest: %s\n",storeKeyText(digest));
+     return digest;
+ }
+ 
++
+ cache_key *
+ storeKeyDup(const cache_key * key)
+ {
+diff -Naur squid-2.7.STABLE9-ori/src/store_modules.c squid-2.7.STABLE9-new/src/store_modules.c
+--- squid-2.7.STABLE9-ori/src/store_modules.c	1970-01-01 08:00:00.000000000 +0800
++++ squid-2.7.STABLE9-new/src/store_modules.c	2014-06-18 02:04:11.808233242 +0800
+@@ -0,0 +1,10 @@
++/* automatically generated by ./store_modules.sh ufs
++ * do not edit
++ */
++#include "squid.h"
++
++extern STSETUP storeFsSetup_ufs;
++void storeFsSetup(void)
++{
++	storeFsAdd("ufs", storeFsSetup_ufs);
++}
+diff -Naur squid-2.7.STABLE9-ori/src/string_arrays.c squid-2.7.STABLE9-new/src/string_arrays.c
+--- squid-2.7.STABLE9-ori/src/string_arrays.c	1970-01-01 08:00:00.000000000 +0800
++++ squid-2.7.STABLE9-new/src/string_arrays.c	2014-06-18 02:04:11.808233242 +0800
+@@ -0,0 +1,114 @@
++#include "squid.h"
++const char *log_tags[] = 
++{
++	"NONE",
++	"TCP_HIT",
++	"TCP_MISS",
++	"TCP_REFRESH_HIT",
++	"TCP_REFRESH_FAIL_HIT",
++	"TCP_REFRESH_MISS",
++	"TCP_CLIENT_REFRESH_MISS",
++	"TCP_IMS_HIT",
++	"TCP_SWAPFAIL_MISS",
++	"TCP_NEGATIVE_HIT",
++	"TCP_MEM_HIT",
++	"TCP_DENIED",
++	"TCP_OFFLINE_HIT",
++#if LOG_TCP_REDIRECTS
++	"TCP_REDIRECT",
++#endif
++	"TCP_STALE_HIT",
++	"TCP_ASYNC_HIT",
++	"TCP_ASYNC_MISS",
++	"UDP_HIT",
++	"UDP_MISS",
++	"UDP_DENIED",
++	"UDP_INVALID",
++	"UDP_MISS_NOFETCH",
++	"ICP_QUERY",
++	"TYPE_MAX"
++};
++
++const char *err_type_str[] = 
++{
++	"ERR_NONE",
++	"ERR_READ_TIMEOUT",
++	"ERR_LIFETIME_EXP",
++	"ERR_READ_ERROR",
++	"ERR_WRITE_ERROR",
++	"ERR_SHUTTING_DOWN",
++	"ERR_CONNECT_FAIL",
++	"ERR_INVALID_REQ",
++	"ERR_UNSUP_REQ",
++	"ERR_INVALID_URL",
++	"ERR_SOCKET_FAILURE",
++	"ERR_DNS_FAIL",
++	"ERR_CANNOT_FORWARD",
++	"ERR_FORWARDING_DENIED",
++	"ERR_NO_RELAY",
++	"ERR_ZERO_SIZE_OBJECT",
++	"ERR_FTP_DISABLED",
++	"ERR_FTP_FAILURE",
++	"ERR_URN_RESOLVE",
++	"ERR_ACCESS_DENIED",
++	"ERR_CACHE_ACCESS_DENIED",
++	"ERR_CACHE_MGR_ACCESS_DENIED",
++	"ERR_SQUID_SIGNATURE",
++	"ERR_FTP_PUT_CREATED",
++	"ERR_FTP_PUT_MODIFIED",
++	"ERR_FTP_PUT_ERROR",
++	"ERR_FTP_NOT_FOUND",
++	"ERR_FTP_FORBIDDEN",
++	"ERR_FTP_UNAVAILABLE",
++	"ERR_ONLY_IF_CACHED_MISS",
++	"ERR_TOO_BIG",
++	"TCP_RESET",
++	"ERR_INVALID_RESP",
++	"ERR_MAX"
++};
++
++const char *lookup_t_str[] = 
++{
++	"LOOKUP_NONE",
++	"LOOKUP_HIT",
++	"LOOKUP_MISS"
++};
++
++const char *icp_opcode_str[] = 
++{
++	"ICP_INVALID",
++	"ICP_QUERY",
++	"ICP_HIT",
++	"ICP_MISS",
++	"ICP_ERR",
++	"ICP_SEND",
++	"ICP_SENDA",
++	"ICP_DATABEG",
++	"ICP_DATA",
++	"ICP_DATAEND",
++	"ICP_SECHO",
++	"ICP_DECHO",
++	"ICP_NOTIFY",
++	"ICP_INVALIDATE",
++	"ICP_DELETE",
++	"ICP_UNUSED15",
++	"ICP_UNUSED16",
++	"ICP_UNUSED17",
++	"ICP_UNUSED18",
++	"ICP_UNUSED19",
++	"ICP_UNUSED20",
++	"ICP_MISS_NOFETCH",
++	"ICP_DENIED",
++	"ICP_HIT_OBJ",
++	"ICP_END"
++};
++
++const char *swap_log_op_str[] = 
++{
++	"SWAP_LOG_NOP",
++	"SWAP_LOG_ADD",
++	"SWAP_LOG_DEL",
++	"SWAP_LOG_VERSION",
++	"SWAP_LOG_MAX"
++};
++
+diff -Naur squid-2.7.STABLE9-ori/txt/exclusions.txt squid-2.7.STABLE9-new/txt/exclusions.txt
+--- squid-2.7.STABLE9-ori/txt/exclusions.txt	1970-01-01 08:00:00.000000000 +0800
++++ squid-2.7.STABLE9-new/txt/exclusions.txt	2014-06-18 02:10:24.236240354 +0800
+@@ -0,0 +1,2 @@
++#If those words in the url,we not do video cache
++.flv?nk=	99
+diff -Naur squid-2.7.STABLE9-ori/txt/keyword.txt squid-2.7.STABLE9-new/txt/keyword.txt
+--- squid-2.7.STABLE9-ori/txt/keyword.txt	1970-01-01 08:00:00.000000000 +0800
++++ squid-2.7.STABLE9-new/txt/keyword.txt	2014-06-18 02:10:24.240240459 +0800
+@@ -0,0 +1,3 @@
++#ddd   200
++/youku/ 100
++/letv-uts/	101
+\ æ–‡ä»¶å°¾æ²¡æœ‰ newline å­—ç¬¦
