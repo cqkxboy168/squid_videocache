@@ -1,0 +1,2 @@
+#If those words in the url,we not do video cache
+.flv?nk=	99
