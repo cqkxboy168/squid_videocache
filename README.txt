@@ -1,4 +1,0 @@
-1.支持视频缓存。
-2.由于视频网站url的规则可能变化，所以通过制作.so动态链接库的方式来解析视频地址URL,libvideoreg提供一些列视频地址解析函数的接口。
-3.squid通过打patch的方式来支持视频缓存。
-1）通过维护2个DFA(有限状态自动机)来匹配keyword.txt和exclusions.txt里面的关键字。然后通过AC算法对URL进行关键字匹配，如果URL中有exclusions.txt的关键字，则URL不做处理。如果URL中有keyword.txt里的关键字，则squid会调用libvideoreg里对应的函数来解析视频URL.
