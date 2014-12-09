@@ -2,11 +2,11 @@ Name:squid_videocahe
 Author:cqkxboy168,cqkxboy168@qq.com  
 Desc:video cache for squid-2.7.STABLE9  
 .  
-├── etc                   squid配置文件  
-├── libvideoreg           视频缓存动态链接库，用来解析不同视频网站URL  
-├── squid-2.7.STABLE9-new 打过patch后的squid-2.7.STABLE9 
-├── squid                 squid-2.7.STABLE9的patch的文件来支持视频缓存  
-└── README.md             说明文件 
+├── etc                   squid配置文件    
+├── libvideoreg           视频缓存动态链接库，用来解析不同视频网站URL    
+├── squid-2.7.STABLE9-new 打过patch后的squid-2.7.STABLE9  
+├── squid                 squid-2.7.STABLE9的视频缓存patch文件    
+└── README.md             说明文件   
 Theory:  
 1.目前支持youku,tudou,letv等网站视频缓存。  
 2.由于视频网站url的规则可能变化，所以通过制作.so动态链接库的方式来解析视频地址URL,提出去视频文件的ID,squid默认使用url计算hash，本项目通过视频文件ID来计算hash，libvideoreg提供一些列视频地址解析函数的接口。  
